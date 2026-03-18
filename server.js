@@ -1,4 +1,4 @@
-// server.js - OpenAI to NVIDIA NIM API Proxy
+// server.js - OpenAI to NVIDIA NIM API Proxy (Chub-friendly)
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
@@ -8,50 +8,136 @@ const PORT = process.env.PORT || 3000;
 
 // Middleware
 app.use(cors());
-app.use(express.json({ limit: '2mb' }));
+app.use(express.json({ limit: '4mb' }));
 
 // NVIDIA NIM API configuration
 const NIM_API_BASE = process.env.NIM_API_BASE || 'https://integrate.api.nvidia.com/v1';
 const NIM_API_KEY = process.env.NIM_API_KEY;
 
-// Shows/hides reasoning in output
+// Show/hide reasoning in output
 const SHOW_REASONING = false;
 
-// Enables thinking for models that support chat_template_kwargs.thinking
-// Для DeepSeek-V3.2 это не гарантированно подтверждено документацией NVIDIA,
-// поэтому по умолчанию выключено.
+// DeepSeek-V3.2 thinking mode is left disabled by default
 const ENABLE_THINKING_MODE = true;
 
 // Model mapping
 const MODEL_MAPPING = {
   'gpt-3.5-turbo': 'nvidia/llama-3.1-nemotron-ultra-253b-v1',
-  'gpt-4': 'qwen/qwen3-coder-480b-a35b-instruct',
-  'gpt-4-turbo': 'moonshotai/kimi-k2-instruct-0905',
+  'gpt-4o': 'qwen/qwen3-coder-480b-a35b-instruct',
 
-  // Можешь использовать как "gpt-4o", так и напрямую "deepseek-v3.2"
-  'gpt-4o': 'deepseek-ai/deepseek-v3.2',
-  'deepseek-v3.2': 'deepseek-ai/deepseek-v3.2',
+  // DeepSeek aliases
+  'gpt-4': 'deepseek-ai/deepseek-v3.2',
+  'gpt-4-turbo': 'deepseek-ai/deepseek-v3.2-speciale',
 
   'claude-3-opus': 'openai/gpt-oss-120b',
   'claude-3-sonnet': 'openai/gpt-oss-20b',
   'gemini-pro': 'qwen/qwen3-next-80b-a3b-thinking'
 };
 
-// Normalize OpenAI-style roles to what NVIDIA endpoint expects
+function contentToString(content) {
+  if (content == null) return '';
+
+  if (typeof content === 'string') {
+    return content;
+  }
+
+  if (Array.isArray(content)) {
+    return content
+      .map((part) => {
+        if (part == null) return '';
+
+        if (typeof part === 'string') {
+          return part;
+        }
+
+        if (typeof part === 'object') {
+          if ((part.type === 'text' || part.type === 'input_text') && typeof part.text === 'string') {
+            return part.text;
+          }
+
+          if (typeof part.text === 'string') {
+            return part.text;
+          }
+
+          if (typeof part.content === 'string') {
+            return part.content;
+          }
+
+          if (Array.isArray(part.content)) {
+            return contentToString(part.content);
+          }
+        }
+
+        return '';
+      })
+      .join('');
+  }
+
+  if (typeof content === 'object') {
+    if (typeof content.text === 'string') {
+      return content.text;
+    }
+
+    if (Array.isArray(content.content)) {
+      return contentToString(content.content);
+    }
+
+    if (typeof content.content === 'string') {
+      return content.content;
+    }
+
+    try {
+      return JSON.stringify(content);
+    } catch {
+      return String(content);
+    }
+  }
+
+  return String(content);
+}
+
 function normalizeMessages(messages) {
   if (!Array.isArray(messages)) return [];
 
   return messages.map((msg) => {
     const role = msg?.role === 'developer' ? 'system' : msg?.role;
 
-    return {
+    const normalized = {
       ...msg,
-      role
+      role,
+      content: contentToString(msg?.content)
     };
+
+    // If Chub or another client sends null/empty content, keep it as empty string
+    if (normalized.content == null) {
+      normalized.content = '';
+    }
+
+    return normalized;
   });
 }
 
-// Health check endpoint
+function pickDefined(source, keys) {
+  const out = {};
+  for (const key of keys) {
+    if (source[key] !== undefined) {
+      out[key] = source[key];
+    }
+  }
+  return out;
+}
+
+function createOpenAIError(status, message, type = 'invalid_request_error') {
+  return {
+    error: {
+      message,
+      type,
+      code: status
+    }
+  };
+}
+
+// Health check
 app.get('/health', (req, res) => {
   res.json({
     status: 'ok',
@@ -63,7 +149,7 @@ app.get('/health', (req, res) => {
   });
 });
 
-// List models endpoint (OpenAI compatible)
+// OpenAI-compatible models list
 app.get('/v1/models', (req, res) => {
   const models = Object.keys(MODEL_MAPPING).map((model) => ({
     id: model,
@@ -78,55 +164,38 @@ app.get('/v1/models', (req, res) => {
   });
 });
 
-// Chat completions endpoint
+// Main proxy endpoint
 app.post('/v1/chat/completions', async (req, res) => {
   try {
     if (!NIM_API_KEY) {
-      return res.status(500).json({
-        error: {
-          message: 'NIM_API_KEY is not configured',
-          type: 'configuration_error',
-          code: 500
-        }
-      });
+      return res.status(500).json(
+        createOpenAIError(500, 'NIM_API_KEY is not configured', 'configuration_error')
+      );
     }
 
+    const body = req.body || {};
     const {
       model,
       messages,
-      temperature,
-      max_tokens,
       stream
-    } = req.body || {};
+    } = body;
 
     if (!model) {
-      return res.status(400).json({
-        error: {
-          message: 'Missing required field: model',
-          type: 'invalid_request_error',
-          code: 400
-        }
-      });
+      return res.status(400).json(createOpenAIError(400, 'Missing required field: model'));
     }
 
     if (!Array.isArray(messages)) {
-      return res.status(400).json({
-        error: {
-          message: 'Missing or invalid required field: messages',
-          type: 'invalid_request_error',
-          code: 400
-        }
-      });
+      return res.status(400).json(createOpenAIError(400, 'Missing or invalid required field: messages'));
     }
 
     const normalizedMessages = normalizeMessages(messages);
 
-    // Smart model selection with fallback
     let nimModel = MODEL_MAPPING[model];
 
+    // If model is not in map, try it directly
     if (!nimModel) {
       try {
-        const probeResponse = await axios.post(
+        const probe = await axios.post(
           `${NIM_API_BASE}/chat/completions`,
           {
             model,
@@ -142,11 +211,11 @@ app.post('/v1/chat/completions', async (req, res) => {
           }
         );
 
-        if (probeResponse.status >= 200 && probeResponse.status < 300) {
+        if (probe.status >= 200 && probe.status < 300) {
           nimModel = model;
         }
       } catch (e) {
-        // ignore probe errors, fallback below
+        // ignore and fallback below
       }
 
       if (!nimModel) {
@@ -170,13 +239,33 @@ app.post('/v1/chat/completions', async (req, res) => {
       }
     }
 
+    const maxTokens =
+      typeof body.max_tokens === 'number'
+        ? body.max_tokens
+        : typeof body.max_completion_tokens === 'number'
+          ? body.max_completion_tokens
+          : 4096;
+
     const nimRequest = {
       model: nimModel,
       messages: normalizedMessages,
-      temperature: typeof temperature === 'number' ? temperature : 0.6,
-      max_tokens: typeof max_tokens === 'number' ? max_tokens : 9024,
-      stream: Boolean(stream)
+      stream: Boolean(stream),
+      max_tokens: maxTokens,
+      ...pickDefined(body, [
+        'temperature',
+        'top_p',
+        'presence_penalty',
+        'frequency_penalty',
+        'stop',
+        'seed',
+        'n',
+        'user'
+      ])
     };
+
+    if (nimRequest.temperature === undefined) {
+      nimRequest.temperature = 0.7;
+    }
 
     if (ENABLE_THINKING_MODE) {
       nimRequest.extra_body = {
@@ -207,15 +296,16 @@ app.post('/v1/chat/completions', async (req, res) => {
       let reasoningStarted = false;
 
       response.data.on('data', (chunk) => {
-        buffer += chunk.toString();
+        buffer += chunk.toString('utf8');
         const lines = buffer.split('\n');
         buffer = lines.pop() || '';
 
-        for (const line of lines) {
+        for (const rawLine of lines) {
+          const line = rawLine.trimEnd();
           if (!line.startsWith('data: ')) continue;
 
           if (line.includes('[DONE]')) {
-            res.write(line + '\n\n');
+            res.write('data: [DONE]\n\n');
             continue;
           }
 
@@ -224,17 +314,18 @@ app.post('/v1/chat/completions', async (req, res) => {
 
             if (data.choices?.[0]?.delta) {
               const delta = data.choices[0].delta;
-              const reasoning = delta.reasoning_content;
-              const content = delta.content;
+
+              const reasoning = contentToString(delta.reasoning_content);
+              const content = contentToString(delta.content);
 
               if (SHOW_REASONING) {
                 let combinedContent = '';
 
                 if (reasoning && !reasoningStarted) {
-                  combinedContent = '<think>\n' + reasoning;
+                  combinedContent += '<think>\n' + reasoning;
                   reasoningStarted = true;
                 } else if (reasoning) {
-                  combinedContent = reasoning;
+                  combinedContent += reasoning;
                 }
 
                 if (content && reasoningStarted) {
@@ -244,21 +335,17 @@ app.post('/v1/chat/completions', async (req, res) => {
                   combinedContent += content;
                 }
 
-                if (combinedContent) {
-                  data.choices[0].delta.content = combinedContent;
-                } else {
-                  data.choices[0].delta.content = '';
-                }
-
-                delete data.choices[0].delta.reasoning_content;
+                delta.content = combinedContent || '';
+                delete delta.reasoning_content;
               } else {
-                data.choices[0].delta.content = content || '';
-                delete data.choices[0].delta.reasoning_content;
+                delta.content = content || '';
+                delete delta.reasoning_content;
               }
             }
 
             res.write(`data: ${JSON.stringify(data)}\n\n`);
           } catch (e) {
+            // Pass through raw line if parse fails
             res.write(line + '\n\n');
           }
         }
@@ -273,42 +360,47 @@ app.post('/v1/chat/completions', async (req, res) => {
         res.end();
       });
 
+      req.on('close', () => {
+        if (response.data?.destroy) {
+          response.data.destroy();
+        }
+      });
+
       return;
     }
 
-    const openaiResponse = {
-      id: `chatcmpl-${Date.now()}`,
-      object: 'chat.completion',
-      created: Math.floor(Date.now() / 1000),
-      model,
-      choices: (response.data.choices || []).map((choice) => {
-        let fullContent = choice.message?.content || '';
+    const sourceData = response.data || {};
 
-        if (SHOW_REASONING && choice.message?.reasoning_content) {
-          fullContent =
-            '<think>\n' +
-            choice.message.reasoning_content +
-            '\n</think>\n\n' +
-            fullContent;
+    const openaiResponse = {
+      id: sourceData.id || `chatcmpl-${Date.now()}`,
+      object: 'chat.completion',
+      created: sourceData.created || Math.floor(Date.now() / 1000),
+      model,
+      choices: (sourceData.choices || []).map((choice) => {
+        let fullContent = contentToString(choice?.message?.content);
+        const reasoningText = contentToString(choice?.message?.reasoning_content);
+
+        if (SHOW_REASONING && reasoningText) {
+          fullContent = `<think>\n${reasoningText}\n</think>\n\n${fullContent}`;
         }
 
         return {
-          index: choice.index ?? 0,
+          index: choice?.index ?? 0,
           message: {
-            role: choice.message?.role || 'assistant',
+            role: choice?.message?.role || 'assistant',
             content: fullContent
           },
-          finish_reason: choice.finish_reason || 'stop'
+          finish_reason: choice?.finish_reason || 'stop'
         };
       }),
-      usage: response.data.usage || {
+      usage: sourceData.usage || {
         prompt_tokens: 0,
         completion_tokens: 0,
         total_tokens: 0
       }
     };
 
-    res.json(openaiResponse);
+    return res.json(openaiResponse);
   } catch (error) {
     console.error('Proxy error:', error.response?.data || error.message);
 
@@ -320,25 +412,29 @@ app.post('/v1/chat/completions', async (req, res) => {
       message = error.response.data;
     }
 
-    res.status(error.response?.status || 500).json({
-      error: {
-        message,
-        type: 'invalid_request_error',
-        code: error.response?.status || 500
-      }
-    });
+    return res
+      .status(error.response?.status || 500)
+      .json(createOpenAIError(error.response?.status || 500, message));
   }
 });
 
-// Catch-all for unsupported endpoints
-app.all('*', (req, res) => {
-  res.status(404).json({
-    error: {
-      message: `Endpoint ${req.path} not found`,
-      type: 'invalid_request_error',
-      code: 404
-    }
+// Optional root info
+app.get('/', (req, res) => {
+  res.json({
+    service: 'OpenAI to NVIDIA NIM Proxy',
+    endpoints: [
+      'GET /health',
+      'GET /v1/models',
+      'POST /v1/chat/completions'
+    ]
   });
+});
+
+// Catch-all
+app.all('*', (req, res) => {
+  res.status(404).json(
+    createOpenAIError(404, `Endpoint ${req.path} not found`)
+  );
 });
 
 app.listen(PORT, () => {
