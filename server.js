@@ -20,7 +20,7 @@ const SHOW_REASONING = false;
 // Enables thinking for models that support chat_template_kwargs.thinking
 // Для DeepSeek-V3.2 это не гарантированно подтверждено документацией NVIDIA,
 // поэтому по умолчанию выключено.
-const ENABLE_THINKING_MODE = false;
+const ENABLE_THINKING_MODE = true;
 
 // Model mapping
 const MODEL_MAPPING = {
