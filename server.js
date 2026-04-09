@@ -17,7 +17,7 @@ const NIM_API_KEY = process.env.NIM_API_KEY;
 // Show/hide reasoning in output
 const SHOW_REASONING = false;
 
-// DeepSeek-V3.2 thinking mode is left disabled by default
+// DeepSeek-V3.2 thinking mode
 const ENABLE_THINKING_MODE = true;
 
 // Timeouts / logging config
@@ -48,6 +48,7 @@ const DEBUG_RECEIVED_OPTION_KEYS = [
   'temperature',
   'top_p',
   'top_k',
+  'repetition_penalty',
   'presence_penalty',
   'frequency_penalty',
   'stop',
@@ -60,6 +61,7 @@ const NIM_FORWARD_OPTION_KEYS = [
   'temperature',
   'top_p',
   'top_k',
+  'repetition_penalty',
   'presence_penalty',
   'frequency_penalty',
   'stop',
@@ -163,12 +165,10 @@ function pickDefined(source, keys) {
 function sanitizeDebugValue(key, value) {
   if (value === undefined) return undefined;
 
-  // Не светим пользовательские идентификаторы
   if (key === 'user') {
     return value == null ? value : '[present]';
   }
 
-  // Не светим стоп-последовательности как текст
   if (key === 'stop') {
     if (typeof value === 'string') {
       return {
@@ -180,7 +180,8 @@ function sanitizeDebugValue(key, value) {
     if (Array.isArray(value)) {
       return {
         type: 'array',
-        count: value.length
+        count: value.length,
+        item_lengths: value.map((v) => String(v ?? '').length)
       };
     }
 
@@ -567,7 +568,6 @@ app.post('/v1/chat/completions', async (req, res) => {
 
             res.write(`data: ${JSON.stringify(data)}\n\n`);
           } catch (e) {
-            // Pass through raw line if parse fails
             res.write(line + '\n\n');
           }
         }
