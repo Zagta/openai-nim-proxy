@@ -41,6 +41,33 @@ const MODEL_MAPPING = {
   'gemini-pro': 'qwen/qwen3-next-80b-a3b-thinking'
 };
 
+const DEBUG_RECEIVED_OPTION_KEYS = [
+  'stream',
+  'max_tokens',
+  'max_completion_tokens',
+  'temperature',
+  'top_p',
+  'top_k',
+  'presence_penalty',
+  'frequency_penalty',
+  'stop',
+  'seed',
+  'n',
+  'user'
+];
+
+const NIM_FORWARD_OPTION_KEYS = [
+  'temperature',
+  'top_p',
+  'top_k',
+  'presence_penalty',
+  'frequency_penalty',
+  'stop',
+  'seed',
+  'n',
+  'user'
+];
+
 function contentToString(content) {
   if (content == null) return '';
 
@@ -115,7 +142,6 @@ function normalizeMessages(messages) {
       content: contentToString(msg?.content)
     };
 
-    // If Chub or another client sends null/empty content, keep it as empty string
     if (normalized.content == null) {
       normalized.content = '';
     }
@@ -132,6 +158,54 @@ function pickDefined(source, keys) {
     }
   }
   return out;
+}
+
+function sanitizeDebugValue(key, value) {
+  if (value === undefined) return undefined;
+
+  // Не светим пользовательские идентификаторы
+  if (key === 'user') {
+    return value == null ? value : '[present]';
+  }
+
+  // Не светим стоп-последовательности как текст
+  if (key === 'stop') {
+    if (typeof value === 'string') {
+      return {
+        type: 'string',
+        length: value.length
+      };
+    }
+
+    if (Array.isArray(value)) {
+      return {
+        type: 'array',
+        count: value.length
+      };
+    }
+
+    return '[present]';
+  }
+
+  return value;
+}
+
+function sanitizeDebugObject(source, keys) {
+  const out = {};
+  for (const key of keys) {
+    if (source[key] !== undefined) {
+      out[key] = sanitizeDebugValue(key, source[key]);
+    }
+  }
+  return out;
+}
+
+function safeBodyKeys(body) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    return [];
+  }
+
+  return Object.keys(body).sort();
 }
 
 function createOpenAIError(status, message, type = 'invalid_request_error') {
@@ -202,8 +276,10 @@ app.get('/debug/recent-requests', (req, res) => {
     nim_model: r.nim_model,
     stream: r.stream,
     message_count: r.message_count,
+    body_keys: r.body_keys || [],
     requested_max_tokens: r.requested_max_tokens,
-    temperature: r.temperature,
+    request_options_received: r.request_options_received || {},
+    request_options_forwarded: r.request_options_forwarded || {},
     model_probe_used: Boolean(r.model_probe_used),
     nim_status: r.nim_status ?? null,
     first_byte_ms: r.first_byte_ms ?? null,
@@ -261,13 +337,14 @@ app.post('/v1/chat/completions', async (req, res) => {
     nim_model: null,
     stream: Boolean(body.stream),
     message_count: Array.isArray(body.messages) ? body.messages.length : 0,
+    body_keys: safeBodyKeys(body),
     requested_max_tokens:
       typeof body.max_tokens === 'number'
         ? body.max_tokens
         : typeof body.max_completion_tokens === 'number'
           ? body.max_completion_tokens
           : 64000,
-    temperature: body.temperature
+    request_options_received: sanitizeDebugObject(body, DEBUG_RECEIVED_OPTION_KEYS)
   });
 
   try {
@@ -377,21 +454,14 @@ app.post('/v1/chat/completions', async (req, res) => {
           ? body.max_completion_tokens
           : 64000;
 
+    const forwardedOptions = pickDefined(body, NIM_FORWARD_OPTION_KEYS);
+
     const nimRequest = {
       model: nimModel,
       messages: normalizedMessages,
       stream: Boolean(stream),
       max_tokens: maxTokens,
-      ...pickDefined(body, [
-        'temperature',
-        'top_p',
-        'presence_penalty',
-        'frequency_penalty',
-        'stop',
-        'seed',
-        'n',
-        'user'
-      ])
+      ...forwardedOptions
     };
 
     if (nimRequest.temperature === undefined) {
@@ -405,6 +475,15 @@ app.post('/v1/chat/completions', async (req, res) => {
         }
       };
     }
+
+    updateRecentRequest(requestId, {
+      request_options_forwarded: {
+        stream: nimRequest.stream,
+        max_tokens: nimRequest.max_tokens,
+        ...sanitizeDebugObject(nimRequest, NIM_FORWARD_OPTION_KEYS),
+        extra_body: nimRequest.extra_body ? nimRequest.extra_body : undefined
+      }
+    });
 
     const response = await axios.post(
       `${NIM_API_BASE}/chat/completions`,
