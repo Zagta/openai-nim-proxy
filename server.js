@@ -20,6 +20,13 @@ const SHOW_REASONING = false;
 // DeepSeek-V3.2 thinking mode is left disabled by default
 const ENABLE_THINKING_MODE = true;
 
+// Timeouts / logging config
+const NIM_TIMEOUT_MS = Number(process.env.NIM_TIMEOUT_MS || 180000);
+const SLOW_REQUEST_MS = Number(process.env.SLOW_REQUEST_MS || 15000);
+
+const RECENT_REQUESTS_LIMIT = 5;
+const recentRequests = [];
+
 // Model mapping
 const MODEL_MAPPING = {
   'gpt-3.5-turbo': 'nvidia/llama-3.1-nemotron-ultra-253b-v1',
@@ -137,6 +144,39 @@ function createOpenAIError(status, message, type = 'invalid_request_error') {
   };
 }
 
+function addRecentRequest(entry) {
+  recentRequests.unshift(entry);
+  if (recentRequests.length > RECENT_REQUESTS_LIMIT) {
+    recentRequests.length = RECENT_REQUESTS_LIMIT;
+  }
+}
+
+function updateRecentRequest(id, patch) {
+  const item = recentRequests.find((r) => r.id === id);
+  if (!item) return;
+  Object.assign(item, patch);
+}
+
+function finalizeRecentRequest(id, patch) {
+  updateRecentRequest(id, {
+    ...patch,
+    finished_at: new Date().toISOString()
+  });
+}
+
+function getRequestLogById(id) {
+  return recentRequests.find((r) => r.id === id) || null;
+}
+
+function logRequestSummary(record) {
+  const base = `[${record.id}] ${record.status} model=${record.client_model} -> ${record.nim_model || 'n/a'} duration=${record.duration_ms ?? 'n/a'}ms`;
+  if ((record.duration_ms ?? 0) >= SLOW_REQUEST_MS) {
+    console.warn('[slow-request]', base);
+  } else {
+    console.log('[request]', base);
+  }
+}
+
 // Health check
 app.get('/health', (req, res) => {
   res.json({
@@ -145,7 +185,50 @@ app.get('/health', (req, res) => {
     nim_api_base: NIM_API_BASE,
     reasoning_display: SHOW_REASONING,
     thinking_mode: ENABLE_THINKING_MODE,
-    api_key_configured: Boolean(NIM_API_KEY)
+    api_key_configured: Boolean(NIM_API_KEY),
+    nim_timeout_ms: NIM_TIMEOUT_MS,
+    slow_request_ms: SLOW_REQUEST_MS,
+    recent_requests_kept: RECENT_REQUESTS_LIMIT
+  });
+});
+
+// Safe recent requests debug endpoint
+app.get('/debug/recent-requests', (req, res) => {
+  const data = recentRequests.map((r) => ({
+    started_at: r.started_at,
+    finished_at: r.finished_at || null,
+    status: r.status,
+    client_model: r.client_model,
+    nim_model: r.nim_model,
+    stream: r.stream,
+    message_count: r.message_count,
+    requested_max_tokens: r.requested_max_tokens,
+    temperature: r.temperature,
+    model_probe_used: Boolean(r.model_probe_used),
+    nim_status: r.nim_status ?? null,
+    first_byte_ms: r.first_byte_ms ?? null,
+    duration_ms: r.duration_ms ?? null,
+    choice_count: r.choice_count ?? null,
+    usage: r.usage || null,
+    has_error: Boolean(r.error),
+    error_type:
+      r.status === 'timeout'
+        ? 'timeout'
+        : r.status === 'stream_error'
+          ? 'stream_error'
+          : r.status === 'error'
+            ? 'error'
+            : r.status === 'configuration_error'
+              ? 'configuration_error'
+              : r.status === 'rejected'
+                ? 'rejected'
+                : null
+  }));
+
+  res.json({
+    limit: RECENT_REQUESTS_LIMIT,
+    count: data.length,
+    data
   });
 });
 
@@ -166,14 +249,40 @@ app.get('/v1/models', (req, res) => {
 
 // Main proxy endpoint
 app.post('/v1/chat/completions', async (req, res) => {
+  const body = req.body || {};
+  const requestId = `req_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  const startedAt = Date.now();
+
+  addRecentRequest({
+    id: requestId, // internal only, not returned by debug endpoint
+    started_at: new Date(startedAt).toISOString(),
+    status: 'received',
+    client_model: body.model || null,
+    nim_model: null,
+    stream: Boolean(body.stream),
+    message_count: Array.isArray(body.messages) ? body.messages.length : 0,
+    requested_max_tokens:
+      typeof body.max_tokens === 'number'
+        ? body.max_tokens
+        : typeof body.max_completion_tokens === 'number'
+          ? body.max_completion_tokens
+          : 64000,
+    temperature: body.temperature
+  });
+
   try {
     if (!NIM_API_KEY) {
+      finalizeRecentRequest(requestId, {
+        status: 'configuration_error',
+        duration_ms: Date.now() - startedAt,
+        error: 'NIM_API_KEY is not configured'
+      });
+
       return res.status(500).json(
         createOpenAIError(500, 'NIM_API_KEY is not configured', 'configuration_error')
       );
     }
 
-    const body = req.body || {};
     const {
       model,
       messages,
@@ -181,19 +290,34 @@ app.post('/v1/chat/completions', async (req, res) => {
     } = body;
 
     if (!model) {
+      finalizeRecentRequest(requestId, {
+        status: 'rejected',
+        duration_ms: Date.now() - startedAt,
+        error: 'Missing required field: model'
+      });
+
       return res.status(400).json(createOpenAIError(400, 'Missing required field: model'));
     }
 
     if (!Array.isArray(messages)) {
+      finalizeRecentRequest(requestId, {
+        status: 'rejected',
+        duration_ms: Date.now() - startedAt,
+        error: 'Missing or invalid required field: messages'
+      });
+
       return res.status(400).json(createOpenAIError(400, 'Missing or invalid required field: messages'));
     }
 
     const normalizedMessages = normalizeMessages(messages);
 
     let nimModel = MODEL_MAPPING[model];
+    let modelProbeUsed = false;
 
     // If model is not in map, try it directly
     if (!nimModel) {
+      modelProbeUsed = true;
+
       try {
         const probe = await axios.post(
           `${NIM_API_BASE}/chat/completions`,
@@ -207,7 +331,8 @@ app.post('/v1/chat/completions', async (req, res) => {
               Authorization: `Bearer ${NIM_API_KEY}`,
               'Content-Type': 'application/json'
             },
-            validateStatus: (status) => status < 500
+            validateStatus: (status) => status < 500,
+            timeout: 10000
           }
         );
 
@@ -238,6 +363,12 @@ app.post('/v1/chat/completions', async (req, res) => {
         }
       }
     }
+
+    updateRecentRequest(requestId, {
+      status: 'upstream_pending',
+      nim_model: nimModel,
+      model_probe_used: modelProbeUsed
+    });
 
     const maxTokens =
       typeof body.max_tokens === 'number'
@@ -283,7 +414,8 @@ app.post('/v1/chat/completions', async (req, res) => {
           Authorization: `Bearer ${NIM_API_KEY}`,
           'Content-Type': 'application/json'
         },
-        responseType: stream ? 'stream' : 'json'
+        responseType: stream ? 'stream' : 'json',
+        timeout: NIM_TIMEOUT_MS
       }
     );
 
@@ -294,8 +426,19 @@ app.post('/v1/chat/completions', async (req, res) => {
 
       let buffer = '';
       let reasoningStarted = false;
+      let firstChunkAt = null;
+      let finalized = false;
 
       response.data.on('data', (chunk) => {
+        if (!firstChunkAt) {
+          firstChunkAt = Date.now();
+          updateRecentRequest(requestId, {
+            status: 'streaming',
+            nim_status: response.status,
+            first_byte_ms: firstChunkAt - startedAt
+          });
+        }
+
         buffer += chunk.toString('utf8');
         const lines = buffer.split('\n');
         buffer = lines.pop() || '';
@@ -352,15 +495,59 @@ app.post('/v1/chat/completions', async (req, res) => {
       });
 
       response.data.on('end', () => {
+        if (finalized) return;
+        finalized = true;
+
+        const durationMs = Date.now() - startedAt;
+
+        finalizeRecentRequest(requestId, {
+          status: 'completed',
+          duration_ms: durationMs,
+          nim_status: response.status,
+          first_byte_ms: firstChunkAt ? firstChunkAt - startedAt : null
+        });
+
+        logRequestSummary(getRequestLogById(requestId) || {
+          id: requestId,
+          status: 'completed',
+          client_model: model,
+          nim_model: nimModel,
+          duration_ms: durationMs
+        });
+
         res.end();
       });
 
       response.data.on('error', (err) => {
-        console.error('Stream error:', err.message);
+        if (finalized) return;
+        finalized = true;
+
+        const durationMs = Date.now() - startedAt;
+
+        finalizeRecentRequest(requestId, {
+          status: 'stream_error',
+          duration_ms: durationMs,
+          nim_status: response.status,
+          first_byte_ms: firstChunkAt ? firstChunkAt - startedAt : null,
+          error: err.message
+        });
+
+        console.error(`[${requestId}] Stream error:`, err.message);
         res.end();
       });
 
       req.on('close', () => {
+        if (!finalized && !res.writableEnded) {
+          finalized = true;
+
+          finalizeRecentRequest(requestId, {
+            status: 'client_closed',
+            duration_ms: Date.now() - startedAt,
+            nim_status: response.status,
+            first_byte_ms: firstChunkAt ? firstChunkAt - startedAt : null
+          });
+        }
+
         if (response.data?.destroy) {
           response.data.destroy();
         }
@@ -400,21 +587,52 @@ app.post('/v1/chat/completions', async (req, res) => {
       }
     };
 
+    const durationMs = Date.now() - startedAt;
+
+    finalizeRecentRequest(requestId, {
+      status: 'completed',
+      duration_ms: durationMs,
+      nim_status: response.status,
+      usage: sourceData.usage || null,
+      choice_count: Array.isArray(sourceData.choices) ? sourceData.choices.length : 0
+    });
+
+    logRequestSummary(getRequestLogById(requestId) || {
+      id: requestId,
+      status: 'completed',
+      client_model: model,
+      nim_model: nimModel,
+      duration_ms: durationMs
+    });
+
     return res.json(openaiResponse);
   } catch (error) {
-    console.error('Proxy error:', error.response?.data || error.message);
+    console.error(`[${requestId}] Proxy error:`, error.response?.data || error.message);
 
+    let status = error.response?.status || 500;
     let message = error.message || 'Internal server error';
+    let errorStatus = 'error';
 
-    if (error.response?.data?.error?.message) {
+    if (error.code === 'ECONNABORTED') {
+      status = 504;
+      message = `Upstream NIM timeout after ${NIM_TIMEOUT_MS} ms`;
+      errorStatus = 'timeout';
+    } else if (error.response?.data?.error?.message) {
       message = error.response.data.error.message;
     } else if (typeof error.response?.data === 'string') {
       message = error.response.data;
     }
 
+    finalizeRecentRequest(requestId, {
+      status: errorStatus,
+      duration_ms: Date.now() - startedAt,
+      nim_status: error.response?.status || null,
+      error: message
+    });
+
     return res
-      .status(error.response?.status || 500)
-      .json(createOpenAIError(error.response?.status || 500, message));
+      .status(status)
+      .json(createOpenAIError(status, message));
   }
 });
 
@@ -424,6 +642,7 @@ app.get('/', (req, res) => {
     service: 'OpenAI to NVIDIA NIM Proxy',
     endpoints: [
       'GET /health',
+      'GET /debug/recent-requests',
       'GET /v1/models',
       'POST /v1/chat/completions'
     ]
@@ -440,8 +659,11 @@ app.all('*', (req, res) => {
 app.listen(PORT, () => {
   console.log(`OpenAI to NVIDIA NIM Proxy running on port ${PORT}`);
   console.log(`Health check: http://localhost:${PORT}/health`);
+  console.log(`Debug recent requests: http://localhost:${PORT}/debug/recent-requests`);
   console.log(`NIM API base: ${NIM_API_BASE}`);
   console.log(`Reasoning display: ${SHOW_REASONING ? 'ENABLED' : 'DISABLED'}`);
   console.log(`Thinking mode: ${ENABLE_THINKING_MODE ? 'ENABLED' : 'DISABLED'}`);
   console.log(`API key configured: ${NIM_API_KEY ? 'YES' : 'NO'}`);
+  console.log(`NIM timeout: ${NIM_TIMEOUT_MS} ms`);
+  console.log(`Slow request threshold: ${SLOW_REQUEST_MS} ms`);
 });
