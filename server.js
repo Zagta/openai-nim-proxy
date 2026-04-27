@@ -303,13 +303,23 @@ function openAIErrorTypeByStatus(status, fallback = 'api_error') {
   return fallback;
 }
 
+// off  = send extra_body with thinking=false
+// fast = non-think / fast, thinking=false + reasoning_effort=fast
+// high = think high / logical analysis
+// max  = think max / full reasoning extent
 function getNimReasoningExtraBody() {
   const mode = NIM_REASONING_MODE;
 
+  // off = explicitly disable thinking, but still send extra_body
   if (['off', 'none', 'disabled', 'disable', 'false', '0'].includes(mode)) {
-    return null;
+    return {
+      chat_template_kwargs: {
+        thinking: false
+      }
+    };
   }
 
+  // fast = non-think / fast, with explicit reasoning_effort
   if (['fast', 'non-think', 'non_think', 'nonthink', 'no-think', 'no_think'].includes(mode)) {
     return {
       chat_template_kwargs: {
@@ -319,6 +329,7 @@ function getNimReasoningExtraBody() {
     };
   }
 
+  // high = think high / logical analysis
   if (['high', 'think-high', 'think_high', 'logical', 'analysis'].includes(mode)) {
     return {
       chat_template_kwargs: {
@@ -328,6 +339,7 @@ function getNimReasoningExtraBody() {
     };
   }
 
+  // max = think max / full reasoning extent
   if (['max', 'think-max', 'think_max', 'full', 'full-reasoning', 'full_reasoning'].includes(mode)) {
     return {
       chat_template_kwargs: {
@@ -337,6 +349,7 @@ function getNimReasoningExtraBody() {
     };
   }
 
+  // Safe fallback
   return {
     chat_template_kwargs: {
       thinking: true,
