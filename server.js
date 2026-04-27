@@ -22,12 +22,15 @@ const SHOW_REASONING = false;
 // DeepSeek-V3.2 thinking mode
 const ENABLE_THINKING_MODE = true;
 
-// Timeouts / logging config
+// Timeouts / retry / logging config
 const NIM_TIMEOUT_MS = Number(process.env.NIM_TIMEOUT_MS || 180000);
 const NIM_RESPONSE_HEADERS_TIMEOUT_MS = Number(process.env.NIM_RESPONSE_HEADERS_TIMEOUT_MS || 15000);
 const NIM_FIRST_CHUNK_TIMEOUT_MS = Number(process.env.NIM_FIRST_CHUNK_TIMEOUT_MS || 30000);
 const NIM_STREAM_IDLE_TIMEOUT_MS = Number(process.env.NIM_STREAM_IDLE_TIMEOUT_MS || 20000);
-const NIM_TIMEOUT_RETRY_SWITCH = /^(1|true|yes|on)$/i.test(String(process.env.NIM_TIMEOUT_RETRY_SWITCH || 'true'));
+
+const NIM_TIMEOUT_RETRY_SWITCH = /^(1|true|yes|on)$/i.test(
+  String(process.env.NIM_TIMEOUT_RETRY_SWITCH || 'true')
+);
 const NIM_TIMEOUT_MAX_RETRIES = Number(process.env.NIM_TIMEOUT_MAX_RETRIES || 5);
 const NIM_TIMEOUT_RETRY_DELAY_MS = Number(process.env.NIM_TIMEOUT_RETRY_DELAY_MS || 1500);
 
@@ -78,6 +81,10 @@ const NIM_FORWARD_OPTION_KEYS = [
   'n',
   'user'
 ];
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 function contentToString(content) {
   if (content == null) return '';
@@ -141,9 +148,6 @@ function contentToString(content) {
   return String(content);
 }
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
 function normalizeMessages(messages) {
   if (!Array.isArray(messages)) return [];
 
@@ -400,6 +404,835 @@ app.post('/v1/chat/completions', async (req, res) => {
     attempts: []
   });
 
+  const state = {
+    finalized: false,
+    clientClosed: false,
+    clientStreamRequested: downstreamStreamRequested,
+    clientHeadersSent: false,
+    winnerAttempt: null,
+    attempts: [],
+    activeController: null,
+    activeStream: null,
+    reasoningStarted: false,
+    aggregate: {
+      id: null,
+      created: null,
+      usage: null,
+      finishReason: 'stop',
+      role: 'assistant',
+      content: '',
+      reasoning: ''
+    }
+  };
+
+  function remainingAbsoluteMs() {
+    return NIM_TIMEOUT_MS - (Date.now() - startedAt);
+  }
+
+  function snapshotAttempts() {
+    return state.attempts.map((attempt) => ({
+      index: attempt.index,
+      status: attempt.status,
+      headers_ms: attempt.headersAt ? attempt.headersAt - startedAt : null,
+      first_byte_ms: attempt.firstDataAt ? attempt.firstDataAt - startedAt : null,
+      nim_status: attempt.nimStatus ?? null,
+      error_type:
+        attempt.status === 'aborted'
+          ? 'aborted'
+          : attempt.status === 'error'
+            ? 'error'
+            : attempt.status === 'stream_error'
+              ? 'stream_error'
+              : null
+    }));
+  }
+
+  function updateAttemptsDebug() {
+    updateRecentRequest(requestId, {
+      attempt_count: state.attempts.length,
+      winner_attempt: state.winnerAttempt,
+      attempts: snapshotAttempts()
+    });
+  }
+
+  function markClientClosed() {
+    if (state.finalized || res.writableEnded) return;
+
+    state.clientClosed = true;
+    state.finalized = true;
+
+    try {
+      state.activeController?.abort();
+    } catch {
+      // ignore
+    }
+
+    safeDestroyStream(state.activeStream);
+
+    finalizeRecentRequest(requestId, {
+      status: 'client_closed',
+      duration_ms: Date.now() - startedAt,
+      attempt_count: state.attempts.length,
+      winner_attempt: state.winnerAttempt
+    });
+  }
+
+  function ensureClientStreamHeaders() {
+    if (!state.clientStreamRequested || state.clientHeadersSent) return;
+
+    state.clientHeadersSent = true;
+    res.status(200);
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+
+    if (typeof res.flushHeaders === 'function') {
+      res.flushHeaders();
+    }
+  }
+
+  function buildOpenAIResponseFromAggregate(model) {
+    let fullContent = state.aggregate.content;
+
+    if (SHOW_REASONING && state.aggregate.reasoning) {
+      fullContent = `<think>\n${state.aggregate.reasoning}\n</think>\n\n${fullContent}`;
+    }
+
+    return {
+      id: state.aggregate.id || `chatcmpl-${Date.now()}`,
+      object: 'chat.completion',
+      created: state.aggregate.created || Math.floor(Date.now() / 1000),
+      model,
+      choices: [
+        {
+          index: 0,
+          message: {
+            role: state.aggregate.role || 'assistant',
+            content: fullContent
+          },
+          finish_reason: state.aggregate.finishReason || 'stop'
+        }
+      ],
+      usage: state.aggregate.usage || {
+        prompt_tokens: 0,
+        completion_tokens: 0,
+        total_tokens: 0
+      }
+    };
+  }
+
+  function finalizeSuccess(model, nimModel) {
+    if (state.finalized) return;
+    state.finalized = true;
+
+    const durationMs = Date.now() - startedAt;
+    const winner = state.attempts.find((a) => a.index === state.winnerAttempt) || null;
+
+    finalizeRecentRequest(requestId, {
+      status: 'completed',
+      duration_ms: durationMs,
+      nim_status: winner?.nimStatus ?? null,
+      first_byte_ms: winner?.firstDataAt ? winner.firstDataAt - startedAt : null,
+      usage: state.aggregate.usage || null,
+      choice_count: 1,
+      attempt_count: state.attempts.length,
+      winner_attempt: state.winnerAttempt
+    });
+
+    logRequestSummary(getRequestLogById(requestId) || {
+      id: requestId,
+      status: 'completed',
+      client_model: model,
+      nim_model: nimModel,
+      duration_ms: durationMs,
+      attempt_count: state.attempts.length,
+      winner_attempt: state.winnerAttempt
+    });
+
+    if (state.clientStreamRequested) {
+      if (!res.writableEnded) {
+        res.end();
+      }
+      return;
+    }
+
+    res.json(buildOpenAIResponseFromAggregate(model));
+  }
+
+  function finalizeWithError(model, nimModel, status, message, errorStatus = 'error', timedOutStage = null) {
+    if (state.finalized) return;
+    state.finalized = true;
+
+    try {
+      state.activeController?.abort();
+    } catch {
+      // ignore
+    }
+
+    safeDestroyStream(state.activeStream);
+
+    const durationMs = Date.now() - startedAt;
+    const winner = state.attempts.find((a) => a.index === state.winnerAttempt) || null;
+
+    finalizeRecentRequest(requestId, {
+      status: errorStatus,
+      duration_ms: durationMs,
+      nim_status: winner?.nimStatus ?? null,
+      first_byte_ms: winner?.firstDataAt ? winner.firstDataAt - startedAt : null,
+      error: message,
+      timed_out_stage: timedOutStage,
+      attempt_count: state.attempts.length,
+      winner_attempt: state.winnerAttempt
+    });
+
+    if (state.clientStreamRequested && state.clientHeadersSent) {
+      res.end();
+      return;
+    }
+
+    res
+      .status(status)
+      .json(
+        createOpenAIError(
+          status,
+          message,
+          errorStatus === 'timeout' ? 'timeout_error' : openAIErrorTypeByStatus(status)
+        )
+      );
+
+    logRequestSummary(getRequestLogById(requestId) || {
+      id: requestId,
+      status: errorStatus,
+      client_model: model,
+      nim_model: nimModel,
+      duration_ms: durationMs,
+      attempt_count: state.attempts.length,
+      winner_attempt: state.winnerAttempt
+    });
+  }
+
+  function processWinnerLine(line) {
+    if (!line.startsWith('data: ')) return;
+
+    const payload = line.slice(6);
+
+    if (payload.includes('[DONE]')) {
+      if (state.clientStreamRequested) {
+        ensureClientStreamHeaders();
+        res.write('data: [DONE]\n\n');
+      }
+      return;
+    }
+
+    try {
+      const data = JSON.parse(payload);
+
+      if (data.id && !state.aggregate.id) {
+        state.aggregate.id = data.id;
+      }
+
+      if (data.created && !state.aggregate.created) {
+        state.aggregate.created = data.created;
+      }
+
+      if (data.usage) {
+        state.aggregate.usage = data.usage;
+      }
+
+      const choice = data.choices?.[0];
+      if (choice?.finish_reason) {
+        state.aggregate.finishReason = choice.finish_reason;
+      }
+
+      if (choice?.delta) {
+        const delta = choice.delta;
+        const reasoning = contentToString(delta.reasoning_content);
+        const content = contentToString(delta.content);
+
+        if (reasoning) {
+          state.aggregate.reasoning += reasoning;
+        }
+
+        if (content) {
+          state.aggregate.content += content;
+        }
+
+        if (choice.delta.role) {
+          state.aggregate.role = choice.delta.role;
+        }
+
+        if (state.clientStreamRequested) {
+          if (SHOW_REASONING) {
+            let combinedContent = '';
+
+            if (reasoning && !state.reasoningStarted) {
+              combinedContent += '<think>\n' + reasoning;
+              state.reasoningStarted = true;
+            } else if (reasoning) {
+              combinedContent += reasoning;
+            }
+
+            if (content && state.reasoningStarted) {
+              combinedContent += '</think>\n\n' + content;
+              state.reasoningStarted = false;
+            } else if (content) {
+              combinedContent += content;
+            }
+
+            delta.content = combinedContent || '';
+            delete delta.reasoning_content;
+          } else {
+            delta.content = content || '';
+            delete delta.reasoning_content;
+          }
+
+          ensureClientStreamHeaders();
+          res.write(`data: ${JSON.stringify(data)}\n\n`);
+        }
+      } else if (state.clientStreamRequested) {
+        ensureClientStreamHeaders();
+        res.write(`data: ${JSON.stringify(data)}\n\n`);
+      }
+    } catch {
+      if (state.clientStreamRequested) {
+        ensureClientStreamHeaders();
+        res.write(line + '\n\n');
+      }
+    }
+  }
+
+  async function runAttemptUntilFirstChunk(index, nimRequest) {
+    const attempt = {
+      index,
+      controller: new AbortController(),
+      response: null,
+      startedAt: Date.now(),
+      headersAt: null,
+      firstDataAt: null,
+      nimStatus: null,
+      status: 'starting',
+      error: null,
+      aborted: false,
+      abortReason: null,
+      settled: false
+    };
+
+    state.attempts.push(attempt);
+    state.activeController = attempt.controller;
+    updateAttemptsDebug();
+
+    const absoluteRemainingAtStart = remainingAbsoluteMs();
+    if (absoluteRemainingAtStart <= 0) {
+      attempt.status = 'aborted';
+      attempt.aborted = true;
+      attempt.abortReason = 'timeout_absolute';
+      attempt.settled = true;
+      updateAttemptsDebug();
+
+      return {
+        type: 'timeout',
+        stage: 'absolute',
+        retryable: false,
+        message: `Upstream absolute timeout after ${NIM_TIMEOUT_MS} ms`,
+        attempt
+      };
+    }
+
+    const headerTimeoutMs = Math.max(
+      1,
+      Math.min(NIM_RESPONSE_HEADERS_TIMEOUT_MS, absoluteRemainingAtStart)
+    );
+
+    try {
+      const response = await axios.post(
+        `${NIM_API_BASE}/chat/completions`,
+        nimRequest,
+        {
+          headers: {
+            Authorization: `Bearer ${NIM_API_KEY}`,
+            'Content-Type': 'application/json'
+          },
+          responseType: 'stream',
+          timeout: headerTimeoutMs,
+          signal: attempt.controller.signal
+        }
+      );
+
+      if (state.clientClosed || state.finalized) {
+        safeDestroyStream(response.data);
+        return { type: 'client_closed', attempt };
+      }
+
+      attempt.response = response;
+      attempt.nimStatus = response.status;
+      attempt.headersAt = Date.now();
+      attempt.status = 'headers_received';
+      state.activeStream = response.data;
+      updateAttemptsDebug();
+
+      const absoluteRemainingForFirstChunk = remainingAbsoluteMs();
+      if (absoluteRemainingForFirstChunk <= 0) {
+        attempt.status = 'aborted';
+        attempt.aborted = true;
+        attempt.abortReason = 'timeout_absolute';
+        attempt.settled = true;
+        safeDestroyStream(response.data);
+        updateAttemptsDebug();
+
+        return {
+          type: 'timeout',
+          stage: 'absolute',
+          retryable: false,
+          message: `Upstream absolute timeout after ${NIM_TIMEOUT_MS} ms`,
+          attempt
+        };
+      }
+
+      const firstChunkTimeoutMs = Math.max(
+        1,
+        Math.min(NIM_FIRST_CHUNK_TIMEOUT_MS, absoluteRemainingForFirstChunk)
+      );
+
+      return await new Promise((resolve) => {
+        let settled = false;
+        const stream = response.data;
+
+        const cleanup = () => {
+          clearTimeout(firstChunkTimer);
+          stream.off('data', onData);
+          stream.off('end', onEnd);
+          stream.off('error', onError);
+        };
+
+        const firstChunkTimer = setTimeout(() => {
+          if (settled) return;
+          settled = true;
+
+          cleanup();
+
+          attempt.status = 'aborted';
+          attempt.aborted = true;
+          attempt.abortReason =
+            firstChunkTimeoutMs < NIM_FIRST_CHUNK_TIMEOUT_MS
+              ? 'timeout_absolute'
+              : 'timeout_before_first_chunk';
+          attempt.settled = true;
+
+          try {
+            attempt.controller.abort();
+          } catch {
+            // ignore
+          }
+
+          safeDestroyStream(stream);
+          updateAttemptsDebug();
+
+          const stage = attempt.abortReason === 'timeout_absolute' ? 'absolute' : 'before_first_chunk';
+
+          resolve({
+            type: 'timeout',
+            stage,
+            retryable: stage !== 'absolute',
+            message:
+              stage === 'absolute'
+                ? `Upstream absolute timeout after ${NIM_TIMEOUT_MS} ms`
+                : `No first stream chunk after ${NIM_FIRST_CHUNK_TIMEOUT_MS} ms`,
+            attempt
+          });
+        }, firstChunkTimeoutMs);
+
+        const onData = (chunk) => {
+          if (settled) return;
+          settled = true;
+
+          cleanup();
+
+          attempt.firstDataAt = Date.now();
+          attempt.status = 'streaming';
+          updateAttemptsDebug();
+
+          stream.pause();
+
+          resolve({
+            type: 'first_chunk',
+            attempt,
+            response,
+            firstChunk: chunk
+          });
+        };
+
+        const onEnd = () => {
+          if (settled) return;
+          settled = true;
+
+          cleanup();
+
+          attempt.status = 'completed';
+          attempt.settled = true;
+          updateAttemptsDebug();
+
+          resolve({
+            type: 'ended_before_first_chunk',
+            attempt,
+            message: 'Upstream stream ended before first chunk'
+          });
+        };
+
+        const onError = (error) => {
+          if (settled) return;
+          settled = true;
+
+          cleanup();
+
+          attempt.settled = true;
+
+          if (state.clientClosed) {
+            attempt.status = 'aborted';
+            attempt.aborted = true;
+            attempt.abortReason = 'client_closed';
+            updateAttemptsDebug();
+
+            resolve({ type: 'client_closed', attempt });
+            return;
+          }
+
+          if (attempt.abortReason === 'timeout_before_first_chunk') {
+            attempt.status = 'aborted';
+            attempt.aborted = true;
+            updateAttemptsDebug();
+
+            resolve({
+              type: 'timeout',
+              stage: 'before_first_chunk',
+              retryable: true,
+              message: `No first stream chunk after ${NIM_FIRST_CHUNK_TIMEOUT_MS} ms`,
+              attempt
+            });
+            return;
+          }
+
+          if (attempt.abortReason === 'timeout_absolute') {
+            attempt.status = 'aborted';
+            attempt.aborted = true;
+            updateAttemptsDebug();
+
+            resolve({
+              type: 'timeout',
+              stage: 'absolute',
+              retryable: false,
+              message: `Upstream absolute timeout after ${NIM_TIMEOUT_MS} ms`,
+              attempt
+            });
+            return;
+          }
+
+          if (isAbortLikeError(error)) {
+            attempt.status = 'aborted';
+            attempt.aborted = true;
+            attempt.abortReason = attempt.abortReason || 'aborted';
+            updateAttemptsDebug();
+
+            resolve({
+              type: attempt.abortReason === 'client_closed' ? 'client_closed' : 'aborted',
+              attempt
+            });
+            return;
+          }
+
+          attempt.status = 'error';
+          attempt.error = error;
+          updateAttemptsDebug();
+
+          resolve({
+            type: 'error_before_first_chunk',
+            attempt,
+            error
+          });
+        };
+
+        stream.on('data', onData);
+        stream.on('end', onEnd);
+        stream.on('error', onError);
+      });
+    } catch (error) {
+      attempt.settled = true;
+
+      if (state.clientClosed) {
+        attempt.status = 'aborted';
+        attempt.aborted = true;
+        attempt.abortReason = 'client_closed';
+        updateAttemptsDebug();
+
+        return { type: 'client_closed', attempt };
+      }
+
+      if (error.code === 'ECONNABORTED') {
+        attempt.status = 'aborted';
+        attempt.aborted = true;
+        attempt.error = error;
+
+        const stage =
+          headerTimeoutMs < NIM_RESPONSE_HEADERS_TIMEOUT_MS
+            ? 'absolute'
+            : 'response_headers';
+
+        updateAttemptsDebug();
+
+        return {
+          type: 'timeout',
+          stage,
+          retryable: stage !== 'absolute',
+          message:
+            stage === 'absolute'
+              ? `Upstream absolute timeout after ${NIM_TIMEOUT_MS} ms`
+              : `Upstream response headers timeout after ${NIM_RESPONSE_HEADERS_TIMEOUT_MS} ms`,
+          attempt
+        };
+      }
+
+      if (isAbortLikeError(error)) {
+        attempt.status = 'aborted';
+        attempt.aborted = true;
+        attempt.abortReason = attempt.abortReason || 'aborted';
+        updateAttemptsDebug();
+
+        return {
+          type: state.clientClosed ? 'client_closed' : 'aborted',
+          attempt
+        };
+      }
+
+      if (error.response?.status) {
+        attempt.status = 'error';
+        attempt.error = error;
+        updateAttemptsDebug();
+
+        return {
+          type: 'http_error',
+          attempt,
+          error
+        };
+      }
+
+      attempt.status = 'error';
+      attempt.error = error;
+      updateAttemptsDebug();
+
+      return {
+        type: 'error_before_first_chunk',
+        attempt,
+        error
+      };
+    }
+  }
+
+  async function consumeWinningStream(model, nimModel, attempt, response, firstChunk) {
+    state.winnerAttempt = attempt.index;
+    state.activeController = attempt.controller;
+    state.activeStream = response.data;
+
+    updateRecentRequest(requestId, {
+      status: 'streaming',
+      nim_status: attempt.nimStatus,
+      first_byte_ms: attempt.firstDataAt ? attempt.firstDataAt - startedAt : null,
+      winner_attempt: attempt.index
+    });
+
+    updateAttemptsDebug();
+
+    const stream = response.data;
+    let buffer = '';
+
+    const processChunk = (chunk) => {
+      buffer += chunk.toString('utf8');
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
+
+      for (const rawLine of lines) {
+        const line = rawLine.trimEnd();
+        processWinnerLine(line);
+      }
+    };
+
+    return await new Promise((resolve) => {
+      let idleTimer = null;
+
+      const cleanup = () => {
+        clearTimeout(idleTimer);
+        stream.off('data', onData);
+        stream.off('end', onEnd);
+        stream.off('error', onError);
+      };
+
+      const resetIdleTimer = () => {
+        clearTimeout(idleTimer);
+
+        const remaining = remainingAbsoluteMs();
+        if (remaining <= 0) {
+          attempt.status = 'aborted';
+          attempt.aborted = true;
+          attempt.abortReason = 'timeout_absolute';
+          attempt.settled = true;
+          cleanup();
+
+          try {
+            attempt.controller.abort();
+          } catch {
+            // ignore
+          }
+
+          safeDestroyStream(stream);
+          updateAttemptsDebug();
+
+          resolve({
+            type: 'absolute_timeout',
+            attempt
+          });
+          return;
+        }
+
+        const effectiveIdleMs = Math.max(
+          1,
+          Math.min(NIM_STREAM_IDLE_TIMEOUT_MS, remaining)
+        );
+
+        idleTimer = setTimeout(() => {
+          attempt.status = 'aborted';
+          attempt.aborted = true;
+          attempt.abortReason =
+            effectiveIdleMs < NIM_STREAM_IDLE_TIMEOUT_MS
+              ? 'timeout_absolute'
+              : 'stream_idle';
+          attempt.settled = true;
+
+          cleanup();
+
+          try {
+            attempt.controller.abort();
+          } catch {
+            // ignore
+          }
+
+          safeDestroyStream(stream);
+          updateAttemptsDebug();
+
+          resolve({
+            type:
+              attempt.abortReason === 'timeout_absolute'
+                ? 'absolute_timeout'
+                : 'stream_idle_timeout',
+            attempt
+          });
+        }, effectiveIdleMs);
+      };
+
+      const onData = (chunk) => {
+        if (state.clientClosed) {
+          cleanup();
+          resolve({ type: 'client_closed', attempt });
+          return;
+        }
+
+        resetIdleTimer();
+        processChunk(chunk);
+        updateAttemptsDebug();
+      };
+
+      const onEnd = () => {
+        cleanup();
+
+        if (buffer.trim().length > 0) {
+          processWinnerLine(buffer.trimEnd());
+          buffer = '';
+        }
+
+        attempt.status = 'completed';
+        attempt.settled = true;
+        updateAttemptsDebug();
+
+        resolve({
+          type: 'completed',
+          attempt
+        });
+      };
+
+      const onError = (error) => {
+        cleanup();
+        attempt.settled = true;
+
+        if (state.clientClosed) {
+          attempt.status = 'aborted';
+          attempt.aborted = true;
+          attempt.abortReason = 'client_closed';
+          updateAttemptsDebug();
+
+          resolve({ type: 'client_closed', attempt });
+          return;
+        }
+
+        if (attempt.abortReason === 'stream_idle') {
+          attempt.status = 'aborted';
+          attempt.aborted = true;
+          updateAttemptsDebug();
+
+          resolve({
+            type: 'stream_idle_timeout',
+            attempt
+          });
+          return;
+        }
+
+        if (attempt.abortReason === 'timeout_absolute') {
+          attempt.status = 'aborted';
+          attempt.aborted = true;
+          updateAttemptsDebug();
+
+          resolve({
+            type: 'absolute_timeout',
+            attempt
+          });
+          return;
+        }
+
+        if (isAbortLikeError(error)) {
+          attempt.status = 'aborted';
+          attempt.aborted = true;
+          attempt.abortReason = attempt.abortReason || 'aborted';
+          updateAttemptsDebug();
+
+          resolve({
+            type: attempt.abortReason === 'client_closed' ? 'client_closed' : 'aborted',
+            attempt
+          });
+          return;
+        }
+
+        attempt.status = 'stream_error';
+        attempt.error = error;
+        updateAttemptsDebug();
+
+        resolve({
+          type: 'stream_error',
+          attempt,
+          error
+        });
+      };
+
+      stream.on('data', onData);
+      stream.on('end', onEnd);
+      stream.on('error', onError);
+
+      resetIdleTimer();
+      processChunk(firstChunk);
+      stream.resume();
+    });
+  }
+
+  res.on('close', () => {
+    if (res.writableEnded) return;
+    markClientClosed();
+  });
+
   try {
     if (!NIM_API_KEY) {
       finalizeRecentRequest(requestId, {
@@ -508,7 +1341,7 @@ app.post('/v1/chat/completions', async (req, res) => {
 
     const forwardedOptions = pickDefined(body, NIM_FORWARD_OPTION_KEYS);
 
-    // Вариант A: ВСЕГДА stream=true на upstream к NIM
+    // ВСЕГДА stream=true на upstream к NIM
     const nimRequest = {
       model: nimModel,
       messages: normalizedMessages,
@@ -538,619 +1371,220 @@ app.post('/v1/chat/completions', async (req, res) => {
       }
     });
 
-    const maxAttempts = NIM_TIMEOUT_RETRY_SWITCH ? Math.max(1, NIM_TIMEOUT_MAX_RETRIES) : 1;
-    const state = {
-      finalized: false,
-      clientStreamRequested: downstreamStreamRequested,
-      clientHeadersSent: false,
-      winnerAttempt: null,
-      attempts: [],
-      bestError: null,
-      reasoningStarted: false,
-      aggregate: {
-        id: null,
-        created: null,
-        usage: null,
-        finishReason: 'stop',
-        role: 'assistant',
-        content: '',
-        reasoning: ''
+    const maxAttempts = NIM_TIMEOUT_RETRY_SWITCH
+      ? Math.max(1, NIM_TIMEOUT_MAX_RETRIES)
+      : 1;
+
+    for (let attemptIndex = 1; attemptIndex <= maxAttempts; attemptIndex += 1) {
+      if (state.clientClosed || state.finalized) {
+        return;
       }
-    };
 
-    let absoluteTimer = null;
-    let firstChunkTimer = null;
-    let idleTimer = null;
-
-    function snapshotAttempts() {
-      return state.attempts.map((attempt) => ({
-        index: attempt.index,
-        status: attempt.status,
-        headers_ms: attempt.headersAt ? attempt.headersAt - startedAt : null,
-        first_byte_ms: attempt.firstDataAt ? attempt.firstDataAt - startedAt : null,
-        nim_status: attempt.nimStatus ?? null,
-        error_type:
-          attempt.status === 'aborted'
-            ? 'aborted'
-            : attempt.status === 'error'
-              ? 'error'
-              : attempt.status === 'stream_error'
-                ? 'stream_error'
-                : null
-      }));
-    }
-
-    function updateAttemptsDebug() {
-      updateRecentRequest(requestId, {
-        attempt_count: state.attempts.length,
-        winner_attempt: state.winnerAttempt,
-        attempts: snapshotAttempts()
-      });
-    }
-
-    function clearAllTimers() {
-      clearTimeout(absoluteTimer);
-      clearTimeout(firstChunkTimer);
-      clearTimeout(idleTimer);
-    }
-
-    function resetIdleTimer() {
-      clearTimeout(idleTimer);
-
-      idleTimer = setTimeout(() => {
+      if (remainingAbsoluteMs() <= 0) {
         finalizeWithError(
+          model,
+          nimModel,
           504,
-          `Stream idle timeout after ${NIM_STREAM_IDLE_TIMEOUT_MS} ms`,
+          `Upstream absolute timeout after ${NIM_TIMEOUT_MS} ms`,
           'timeout',
-          'stream_idle'
+          'absolute'
         );
-      }, NIM_STREAM_IDLE_TIMEOUT_MS);
-    }
-
-    function ensureClientStreamHeaders() {
-      if (!state.clientStreamRequested || state.clientHeadersSent) return;
-
-      state.clientHeadersSent = true;
-      res.status(200);
-      res.setHeader('Content-Type', 'text/event-stream');
-      res.setHeader('Cache-Control', 'no-cache');
-      res.setHeader('Connection', 'keep-alive');
-
-      if (typeof res.flushHeaders === 'function') {
-        res.flushHeaders();
-      }
-    }
-
-    function abortAttempt(attempt, reason = 'aborted') {
-      if (!attempt || attempt.aborted) return;
-
-      attempt.aborted = true;
-      attempt.status = 'aborted';
-      attempt.abortReason = reason;
-
-      try {
-        attempt.controller.abort();
-      } catch {
-        // ignore
-      }
-
-      safeDestroyStream(attempt.response?.data);
-      updateAttemptsDebug();
-    }
-
-    function abortAllAttempts(reason = 'aborted') {
-      for (const attempt of state.attempts) {
-        abortAttempt(attempt, reason);
-      }
-    }
-    
-    function buildOpenAIResponseFromAggregate() {
-      let fullContent = state.aggregate.content;
-
-      if (SHOW_REASONING && state.aggregate.reasoning) {
-        fullContent = `<think>\n${state.aggregate.reasoning}\n</think>\n\n${fullContent}`;
-      }
-
-      return {
-        id: state.aggregate.id || `chatcmpl-${Date.now()}`,
-        object: 'chat.completion',
-        created: state.aggregate.created || Math.floor(Date.now() / 1000),
-        model,
-        choices: [
-          {
-            index: 0,
-            message: {
-              role: state.aggregate.role || 'assistant',
-              content: fullContent
-            },
-            finish_reason: state.aggregate.finishReason || 'stop'
-          }
-        ],
-        usage: state.aggregate.usage || {
-          prompt_tokens: 0,
-          completion_tokens: 0,
-          total_tokens: 0
-        }
-      };
-    }
-
-    function finalizeSuccess() {
-      if (state.finalized) return;
-      state.finalized = true;
-      clearAllTimers();
-
-      const durationMs = Date.now() - startedAt;
-      const winner = state.attempts.find((a) => a.index === state.winnerAttempt) || null;
-
-      finalizeRecentRequest(requestId, {
-        status: 'completed',
-        duration_ms: durationMs,
-        nim_status: winner?.nimStatus ?? null,
-        first_byte_ms: winner?.firstDataAt ? winner.firstDataAt - startedAt : null,
-        usage: state.aggregate.usage || null,
-        choice_count: 1,
-        attempt_count: state.attempts.length,
-        winner_attempt: state.winnerAttempt
-      });
-
-      logRequestSummary(getRequestLogById(requestId) || {
-        id: requestId,
-        status: 'completed',
-        client_model: model,
-        nim_model: nimModel,
-        duration_ms: durationMs,
-        attempt_count: state.attempts.length,
-        winner_attempt: state.winnerAttempt
-      });
-
-      if (state.clientStreamRequested) {
-        if (!res.writableEnded) {
-          res.end();
-        }
         return;
       }
 
-      return res.json(buildOpenAIResponseFromAggregate());
-    }
+      const firstStageResult = await runAttemptUntilFirstChunk(attemptIndex, nimRequest);
 
-    function finalizeWithError(status, message, errorStatus = 'error', timedOutStage = null) {
-      if (state.finalized) return;
-      state.finalized = true;
-      clearAllTimers();
-
-      const durationMs = Date.now() - startedAt;
-      const winner = state.attempts.find((a) => a.index === state.winnerAttempt) || null;
-
-      abortAllAttempts(errorStatus === 'timeout' ? 'timeout' : 'error');
-
-      finalizeRecentRequest(requestId, {
-        status: errorStatus,
-        duration_ms: durationMs,
-        nim_status: winner?.nimStatus ?? state.bestError?.response?.status ?? null,
-        first_byte_ms: winner?.firstDataAt ? winner.firstDataAt - startedAt : null,
-        error: message,
-        timed_out_stage: timedOutStage,
-        attempt_count: state.attempts.length,
-        winner_attempt: state.winnerAttempt
-      });
-
-      if (state.clientStreamRequested && state.clientHeadersSent) {
-        res.end();
+      if (state.clientClosed || state.finalized) {
         return;
       }
 
-      return res
-        .status(status)
-        .json(
-          createOpenAIError(
+      if (firstStageResult.type === 'first_chunk') {
+        const winnerResult = await consumeWinningStream(
+          model,
+          nimModel,
+          firstStageResult.attempt,
+          firstStageResult.response,
+          firstStageResult.firstChunk
+        );
+
+        if (state.clientClosed || state.finalized) {
+          return;
+        }
+
+        if (winnerResult.type === 'completed') {
+          finalizeSuccess(model, nimModel);
+          return;
+        }
+
+        if (winnerResult.type === 'stream_idle_timeout') {
+          finalizeWithError(
+            model,
+            nimModel,
+            504,
+            `Stream idle timeout after ${NIM_STREAM_IDLE_TIMEOUT_MS} ms`,
+            'timeout',
+            'stream_idle'
+          );
+          return;
+        }
+
+        if (winnerResult.type === 'absolute_timeout') {
+          finalizeWithError(
+            model,
+            nimModel,
+            504,
+            `Upstream absolute timeout after ${NIM_TIMEOUT_MS} ms`,
+            'timeout',
+            'absolute'
+          );
+          return;
+        }
+
+        if (winnerResult.type === 'stream_error') {
+          const error = winnerResult.error;
+          const status = error?.response?.status || 502;
+          const message =
+            error?.response?.data?.error?.message ||
+            (typeof error?.response?.data === 'string' ? error.response.data : error?.message) ||
+            'Upstream stream failed';
+
+          finalizeWithError(
+            model,
+            nimModel,
             status,
             message,
-            errorStatus === 'timeout' ? 'timeout_error' : openAIErrorTypeByStatus(status)
-          )
-        );
-    }
-
-    function maybeFailEarlyIfAllAttemptsDead() {
-      if (state.finalized || state.winnerAttempt) return;
-
-      const anyActive = state.attempts.some((attempt) => !attempt.settled && !attempt.aborted);
-      if (anyActive) return;
-    
-      const lastAttempt = state.attempts[state.attempts.length - 1];
-      const lastError = lastAttempt?.error || state.bestError;
-    
-      const timedOutOnHeaders = lastError?.code === 'ECONNABORTED';
-      const timedOutBeforeFirstChunk = !lastAttempt?.firstDataAt && lastAttempt?.status === 'aborted' && lastAttempt?.abortReason === 'timeout_before_first_chunk';
-    
-      if (timedOutOnHeaders) {
-        const retried = await retryIfAllowed('response_headers', `Upstream response headers timeout after ${NIM_RESPONSE_HEADERS_TIMEOUT_MS} ms`);
-        if (retried) return;
-    
-        finalizeWithError(
-          504,
-          `Upstream response headers timeout after ${NIM_RESPONSE_HEADERS_TIMEOUT_MS} ms`,
-          'timeout',
-          'response_headers'
-        );
-        return;
-      }
-    
-      if (timedOutBeforeFirstChunk) {
-        const retried = await retryIfAllowed('before_first_chunk', `No first stream chunk after ${NIM_FIRST_CHUNK_TIMEOUT_MS} ms`);
-        if (retried) return;
-    
-        finalizeWithError(
-          504,
-          `No first stream chunk after ${NIM_FIRST_CHUNK_TIMEOUT_MS} ms`,
-          'timeout',
-          'before_first_chunk'
-        );
-        return;
-      }
-    
-      if (lastError?.response?.status) {
-        let message = 'Upstream request failed';
-        if (lastError.response?.data?.error?.message) {
-          message = lastError.response.data.error.message;
-        } else if (typeof lastError.response?.data === 'string') {
-          message = lastError.response.data;
-        } else if (lastError.message) {
-          message = lastError.message;
+            'stream_error',
+            null
+          );
+          return;
         }
-    
+
         finalizeWithError(
-          lastError.response.status,
+          model,
+          nimModel,
+          502,
+          'Winner stream ended unexpectedly',
+          'stream_error',
+          null
+        );
+        return;
+      }
+
+      if (firstStageResult.type === 'timeout') {
+        updateRecentRequest(requestId, {
+          timed_out_stage: firstStageResult.stage
+        });
+
+        if (firstStageResult.retryable && attemptIndex < maxAttempts && NIM_TIMEOUT_RETRY_SWITCH) {
+          updateRecentRequest(requestId, {
+            status: 'retrying',
+            timed_out_stage: firstStageResult.stage
+          });
+
+          if (NIM_TIMEOUT_RETRY_DELAY_MS > 0) {
+            const delayMs = Math.min(
+              NIM_TIMEOUT_RETRY_DELAY_MS,
+              Math.max(0, remainingAbsoluteMs())
+            );
+
+            if (delayMs > 0) {
+              await sleep(delayMs);
+            }
+          }
+
+          continue;
+        }
+
+        finalizeWithError(
+          model,
+          nimModel,
+          504,
+          firstStageResult.message,
+          'timeout',
+          firstStageResult.stage
+        );
+        return;
+      }
+
+      if (firstStageResult.type === 'ended_before_first_chunk') {
+        finalizeWithError(
+          model,
+          nimModel,
+          502,
+          firstStageResult.message || 'Upstream stream ended before first chunk',
+          'error',
+          null
+        );
+        return;
+      }
+
+      if (firstStageResult.type === 'http_error') {
+        const error = firstStageResult.error;
+        let message = 'Upstream request failed';
+
+        if (error?.response?.data?.error?.message) {
+          message = error.response.data.error.message;
+        } else if (typeof error?.response?.data === 'string') {
+          message = error.response.data;
+        } else if (error?.message) {
+          message = error.message;
+        }
+
+        finalizeWithError(
+          model,
+          nimModel,
+          error.response.status,
           message,
           'error',
           null
         );
         return;
       }
-    
-      finalizeWithError(
-        502,
-        lastError?.message || 'All upstream attempts failed',
-        isAbortLikeError(lastError) ? 'timeout' : 'error',
-        null
-      );
-    }
 
-    async function retryIfAllowed(stage, errorMessage) {
-      if (state.finalized) return false;
-      if (!NIM_TIMEOUT_RETRY_SWITCH) return false;
-      if (state.winnerAttempt) return false; // уже пошёл стрим, retry опасен
-      if (state.attempts.length >= maxAttempts) return false;
-    
-      updateRecentRequest(requestId, {
-        status: 'retrying',
-        timed_out_stage: stage
-      });
-    
-      if (NIM_TIMEOUT_RETRY_DELAY_MS > 0) {
-        await sleep(NIM_TIMEOUT_RETRY_DELAY_MS);
-      }
-    
-      if (state.finalized || state.winnerAttempt) return false;
-    
-      await startAttempt(state.attempts.length + 1);
-      return true;
-    }
-       
-    function onWinnerSelected(attempt) {
-      if (state.winnerAttempt) return;
-      state.winnerAttempt = attempt.index;
-
-      clearTimeout(firstChunkTimer);
-
-      updateRecentRequest(requestId, {
-        status: 'streaming',
-        nim_status: attempt.nimStatus,
-        first_byte_ms: attempt.firstDataAt - startedAt,
-        winner_attempt: attempt.index
-      });
-
-      updateAttemptsDebug();
-      resetIdleTimer();
-    }
-
-    function processWinnerLine(line) {
-      if (!line.startsWith('data: ')) return;
-
-      const payload = line.slice(6);
-
-      if (payload.includes('[DONE]')) {
-        if (state.clientStreamRequested) {
-          ensureClientStreamHeaders();
-          res.write('data: [DONE]\n\n');
-        }
-        return;
-      }
-
-      try {
-        const data = JSON.parse(payload);
-
-        if (data.id && !state.aggregate.id) {
-          state.aggregate.id = data.id;
-        }
-
-        if (data.created && !state.aggregate.created) {
-          state.aggregate.created = data.created;
-        }
-
-        if (data.usage) {
-          state.aggregate.usage = data.usage;
-        }
-
-        const choice = data.choices?.[0];
-        if (choice?.finish_reason) {
-          state.aggregate.finishReason = choice.finish_reason;
-        }
-
-        if (choice?.delta) {
-          const delta = choice.delta;
-          const reasoning = contentToString(delta.reasoning_content);
-          const content = contentToString(delta.content);
-
-          if (reasoning) {
-            state.aggregate.reasoning += reasoning;
-          }
-
-          if (content) {
-            state.aggregate.content += content;
-          }
-
-          if (choice.delta.role) {
-            state.aggregate.role = choice.delta.role;
-          }
-
-          if (state.clientStreamRequested) {
-            if (SHOW_REASONING) {
-              let combinedContent = '';
-
-              if (reasoning && !state.reasoningStarted) {
-                combinedContent += '<think>\n' + reasoning;
-                state.reasoningStarted = true;
-              } else if (reasoning) {
-                combinedContent += reasoning;
-              }
-
-              if (content && state.reasoningStarted) {
-                combinedContent += '</think>\n\n' + content;
-                state.reasoningStarted = false;
-              } else if (content) {
-                combinedContent += content;
-              }
-
-              delta.content = combinedContent || '';
-              delete delta.reasoning_content;
-            } else {
-              delta.content = content || '';
-              delete delta.reasoning_content;
-            }
-
-            ensureClientStreamHeaders();
-            res.write(`data: ${JSON.stringify(data)}\n\n`);
-          }
-        } else if (state.clientStreamRequested) {
-          ensureClientStreamHeaders();
-          res.write(`data: ${JSON.stringify(data)}\n\n`);
-        }
-      } catch {
-        if (state.clientStreamRequested) {
-          ensureClientStreamHeaders();
-          res.write(line + '\n\n');
-        }
-      }
-    }
-
-    function onAttemptData(attempt, chunk) {
-      if (state.finalized) return;
-      if (attempt.aborted) return;
-
-      if (!attempt.firstDataAt) {
-        attempt.firstDataAt = Date.now();
-        attempt.status = 'streaming';
-        onWinnerSelected(attempt);
-      } else if (state.winnerAttempt === attempt.index) {
-        resetIdleTimer();
-      }
-
-      if (state.winnerAttempt !== attempt.index) {
-        return;
-      }
-
-      attempt.buffer += chunk.toString('utf8');
-      const lines = attempt.buffer.split('\n');
-      attempt.buffer = lines.pop() || '';
-
-      for (const rawLine of lines) {
-        const line = rawLine.trimEnd();
-        processWinnerLine(line);
-      }
-
-      updateAttemptsDebug();
-    }
-
-    function onAttemptEnd(attempt) {
-      attempt.settled = true;
-      attempt.status = 'completed';
-      updateAttemptsDebug();
-
-      if (state.finalized) return;
-
-      if (state.winnerAttempt === attempt.index) {
-        finalizeSuccess();
-      } else {
-        maybeFailEarlyIfAllAttemptsDead();
-      }
-    }
-
-    function onAttemptFailure(attempt, error, phase = 'error') {
-      if (attempt.settled) return;
-
-      attempt.settled = true;
-
-      if (attempt.aborted || isAbortLikeError(error)) {
-        attempt.status = 'aborted';
-        updateAttemptsDebug();
-
-        if (!state.winnerAttempt) {
-          maybeFailEarlyIfAllAttemptsDead();
-        }
-
-        return;
-      }
-
-      attempt.status = phase === 'stream' ? 'stream_error' : 'error';
-      attempt.error = error;
-
-      if (!state.bestError) {
-        state.bestError = error;
-      }
-
-      updateAttemptsDebug();
-
-      if (!state.winnerAttempt) {
-        if (NIM_TIMEOUT_HEDGE_SWITCH && state.attempts.length < maxAttempts) {
-          maybeStartHedge();
-        }
-
-        maybeFailEarlyIfAllAttemptsDead();
-        return;
-      }
-
-      if (state.winnerAttempt === attempt.index) {
-        const status = error?.code === 'ECONNABORTED' ? 504 : (error?.response?.status || 502);
+      if (firstStageResult.type === 'error_before_first_chunk') {
+        const error = firstStageResult.error;
+        const status = error?.response?.status || 502;
         const message =
-          error?.code === 'ECONNABORTED'
-            ? `Stream timeout after ${NIM_STREAM_IDLE_TIMEOUT_MS} ms`
-            : error?.response?.data?.error?.message ||
-              (typeof error?.response?.data === 'string' ? error.response.data : error?.message) ||
-              'Upstream stream failed';
+          error?.response?.data?.error?.message ||
+          (typeof error?.response?.data === 'string' ? error.response.data : error?.message) ||
+          'Upstream request failed before first chunk';
 
         finalizeWithError(
+          model,
+          nimModel,
           status,
           message,
-          error?.code === 'ECONNABORTED' ? 'timeout' : 'stream_error',
-          error?.code === 'ECONNABORTED' ? 'stream_idle' : null
+          'error',
+          null
         );
+        return;
+      }
+
+      if (firstStageResult.type === 'client_closed') {
+        return;
+      }
+
+      if (firstStageResult.type === 'aborted') {
+        finalizeWithError(
+          model,
+          nimModel,
+          502,
+          'Upstream request aborted',
+          'error',
+          null
+        );
+        return;
       }
     }
 
-    function startAttempt(index) {
-      if (state.finalized) return;
-      if (state.attempts.some((a) => a.index === index)) return;
-    
-      const controller = new AbortController();
-      const attempt = {
-        index,
-        controller,
-        response: null,
-        buffer: '',
-        startedAt: Date.now(),
-        headersAt: null,
-        firstDataAt: null,
-        nimStatus: null,
-        settled: false,
-        aborted: false,
-        status: 'starting',
-        error: null
-      };
-    
-      state.attempts.push(attempt);
-      updateAttemptsDebug();
-    
-      try {
-        const response = await axios.post(
-          `${NIM_API_BASE}/chat/completions`,
-          nimRequest,
-          {
-            headers: {
-              Authorization: `Bearer ${NIM_API_KEY}`,
-              'Content-Type': 'application/json'
-            },
-            responseType: 'stream',
-            timeout: NIM_RESPONSE_HEADERS_TIMEOUT_MS,
-            signal: controller.signal
-          }
-        );
-    
-        if (state.finalized || attempt.aborted) {
-          safeDestroyStream(response.data);
-          return;
-        }
-    
-        attempt.response = response;
-        attempt.nimStatus = response.status;
-        attempt.headersAt = Date.now();
-        attempt.status = 'headers_received';
-        updateAttemptsDebug();
-    
-        response.data.on('data', (chunk) => onAttemptData(attempt, chunk));
-        response.data.on('end', () => onAttemptEnd(attempt));
-        response.data.on('error', (err) => onAttemptFailure(attempt, err, 'stream'));
-      } catch (error) {
-        onAttemptFailure(attempt, error, 'setup');
-      }
-    }
-
-    // Global client-close handling
-    // Real client disconnect handling
-    res.on('close', () => {
-      // Если мы сами уже штатно завершили ответ, ничего не делаем
-      if (state.finalized || res.writableEnded) return;
-    
-      state.finalized = true;
-      clearAllTimers();
-      abortAllAttempts('client_closed');
-    
-      finalizeRecentRequest(requestId, {
-        status: 'client_closed',
-        duration_ms: Date.now() - startedAt,
-        attempt_count: state.attempts.length,
-        winner_attempt: state.winnerAttempt
-      });
-    });
-
-    // Global timeouts
-    absoluteTimer = setTimeout(async () => {
-      if (state.finalized) return;
-    
-      if (!state.winnerAttempt) {
-        const activeAttempt = state.attempts.find((a) => !a.settled && !a.aborted);
-        if (activeAttempt) {
-          activeAttempt.abortReason = 'timeout_absolute';
-          abortAttempt(activeAttempt, 'timeout_absolute');
-        }
-    
-        const retried = await retryIfAllowed('absolute', `Upstream absolute timeout after ${NIM_TIMEOUT_MS} ms`);
-        if (retried) return;
-      }
-    
-      finalizeWithError(
-        504,
-        `Upstream absolute timeout after ${NIM_TIMEOUT_MS} ms`,
-        'timeout',
-        'absolute'
-      );
-    }, NIM_TIMEOUT_MS);
-
-    firstChunkTimer = setTimeout(async () => {
-      if (state.finalized || state.winnerAttempt) return;
-    
-      const activeAttempt = state.attempts.find((a) => !a.settled && !a.aborted);
-      if (activeAttempt) {
-        activeAttempt.abortReason = 'timeout_before_first_chunk';
-        abortAttempt(activeAttempt, 'timeout_before_first_chunk');
-      }
-    
-      await maybeFailEarlyIfAllAttemptsDead();
-    }, NIM_FIRST_CHUNK_TIMEOUT_MS);
-
-    // Start first upstream attempt
-    startAttempt(1);
-
-    return;
+    finalizeWithError(
+      body.model,
+      MODEL_MAPPING[body.model] || body.model || null,
+      502,
+      'All upstream attempts failed',
+      'error',
+      null
+    );
   } catch (error) {
     console.error(`[${requestId}] Proxy error:`, error.response?.data || error.message);
 
@@ -1175,9 +1609,19 @@ app.post('/v1/chat/completions', async (req, res) => {
       error: message
     });
 
-    return res
-      .status(status)
-      .json(createOpenAIError(status, message, errorStatus === 'timeout' ? 'timeout_error' : openAIErrorTypeByStatus(status)));
+    if (!res.headersSent) {
+      return res
+        .status(status)
+        .json(
+          createOpenAIError(
+            status,
+            message,
+            errorStatus === 'timeout' ? 'timeout_error' : openAIErrorTypeByStatus(status)
+          )
+        );
+    }
+
+    res.end();
   }
 });
 
