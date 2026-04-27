@@ -1066,13 +1066,15 @@ app.post('/v1/chat/completions', async (req, res) => {
     }
 
     // Global client-close handling
-    req.on('close', () => {
-      if (state.finalized) return;
-
+    // Real client disconnect handling
+    res.on('close', () => {
+      // Если мы сами уже штатно завершили ответ, ничего не делаем
+      if (state.finalized || res.writableEnded) return;
+    
       state.finalized = true;
       clearAllTimers();
       abortAllAttempts('client_closed');
-
+    
       finalizeRecentRequest(requestId, {
         status: 'client_closed',
         duration_ms: Date.now() - startedAt,
