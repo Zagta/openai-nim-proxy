@@ -22,12 +22,24 @@ const SIMPLE_NIM = /^(1|true|yes|on)$/i.test(String(process.env.SIMPLE_NIM || 'f
 // Show/hide reasoning in output
 const SHOW_REASONING = false;
 
-// DeepSeek-V3.2 thinking mode
-const ENABLE_THINKING_MODE = true;
+// Force max_tokens override.
+// 0 / unset = do not override client value.
+const NIM_FORCE_MAX_TOKENS = Number(process.env.NIM_FORCE_MAX_TOKENS || 0);
+const NIM_FORCE_MAX_TOKENS_ENABLED =
+  Number.isFinite(NIM_FORCE_MAX_TOKENS) && NIM_FORCE_MAX_TOKENS > 0;
+
+// Reasoning / thinking profile.
+// off  = do not send extra_body
+// fast = non-think / fast
+// high = think high / logical analysis
+// max  = think max / full reasoning extent
+const NIM_REASONING_MODE = String(process.env.NIM_REASONING_MODE || 'high')
+  .trim()
+  .toLowerCase();
 
 // Advanced-mode timeouts / retry / logging config
-const NIM_TIMEOUT_MS = Number(process.env.NIM_TIMEOUT_MS || 180000);
-const NIM_RESPONSE_HEADERS_TIMEOUT_MS = Number(process.env.NIM_RESPONSE_HEADERS_TIMEOUT_MS || 15000);
+const NIM_TIMEOUT_MS = Number(process.env.NIM_TIMEOUT_MS || 200000);
+const NIM_RESPONSE_HEADERS_TIMEOUT_MS = Number(process.env.NIM_RESPONSE_HEADERS_TIMEOUT_MS || 150000);
 const NIM_FIRST_CHUNK_TIMEOUT_MS = Number(process.env.NIM_FIRST_CHUNK_TIMEOUT_MS || 30000);
 const NIM_STREAM_IDLE_TIMEOUT_MS = Number(process.env.NIM_STREAM_IDLE_TIMEOUT_MS || 20000);
 
@@ -45,7 +57,6 @@ const recentRequests = [];
 // Model mapping
 const MODEL_MAPPING = {
   'gpt-3.5-turbo': 'nvidia/llama-3.1-nemotron-ultra-253b-v1',
-  
 
   // DeepSeek aliases
   'gpt-4o': 'deepseek-ai/deepseek-v3.2',
@@ -292,6 +303,58 @@ function openAIErrorTypeByStatus(status, fallback = 'api_error') {
   return fallback;
 }
 
+function getNimReasoningExtraBody() {
+  const mode = NIM_REASONING_MODE;
+
+  if (['off', 'none', 'disabled', 'disable', 'false', '0'].includes(mode)) {
+    return null;
+  }
+
+  if (['fast', 'non-think', 'non_think', 'nonthink', 'no-think', 'no_think'].includes(mode)) {
+    return {
+      chat_template_kwargs: {
+        thinking: false,
+        reasoning_effort: 'fast'
+      }
+    };
+  }
+
+  if (['high', 'think-high', 'think_high', 'logical', 'analysis'].includes(mode)) {
+    return {
+      chat_template_kwargs: {
+        thinking: true,
+        reasoning_effort: 'high'
+      }
+    };
+  }
+
+  if (['max', 'think-max', 'think_max', 'full', 'full-reasoning', 'full_reasoning'].includes(mode)) {
+    return {
+      chat_template_kwargs: {
+        thinking: true,
+        reasoning_effort: 'max'
+      }
+    };
+  }
+
+  return {
+    chat_template_kwargs: {
+      thinking: true,
+      reasoning_effort: 'high'
+    }
+  };
+}
+
+function getNimReasoningDebug() {
+  const extraBody = getNimReasoningExtraBody();
+
+  return {
+    mode: NIM_REASONING_MODE,
+    extra_body_enabled: Boolean(extraBody),
+    chat_template_kwargs: extraBody?.chat_template_kwargs || null
+  };
+}
+
 function makeOpenAIResponseFromSourceData(sourceData, clientModel) {
   return {
     id: sourceData.id || `chatcmpl-${Date.now()}`,
@@ -416,12 +479,16 @@ async function resolveNimModel(model) {
 }
 
 function buildNimRequest(body, nimModel, normalizedMessages, streamValue) {
-  const maxTokens =
+  const clientMaxTokens =
     typeof body.max_tokens === 'number'
       ? body.max_tokens
       : typeof body.max_completion_tokens === 'number'
         ? body.max_completion_tokens
         : 64000;
+
+  const effectiveMaxTokens = NIM_FORCE_MAX_TOKENS_ENABLED
+    ? NIM_FORCE_MAX_TOKENS
+    : clientMaxTokens;
 
   const forwardedOptions = pickDefined(body, NIM_FORWARD_OPTION_KEYS);
 
@@ -429,20 +496,20 @@ function buildNimRequest(body, nimModel, normalizedMessages, streamValue) {
     model: nimModel,
     messages: normalizedMessages,
     stream: streamValue,
-    max_tokens: maxTokens,
+    max_tokens: effectiveMaxTokens,
     ...forwardedOptions
   };
+
+  // Ensure force max_tokens always wins.
+  nimRequest.max_tokens = effectiveMaxTokens;
 
   if (nimRequest.temperature === undefined) {
     nimRequest.temperature = 0.7;
   }
 
-  if (ENABLE_THINKING_MODE) {
-    nimRequest.extra_body = {
-      chat_template_kwargs: {
-        thinking: true
-      }
-    };
+  const forcedExtraBody = getNimReasoningExtraBody();
+  if (forcedExtraBody) {
+    nimRequest.extra_body = forcedExtraBody;
   }
 
   return nimRequest;
@@ -1749,7 +1816,8 @@ app.get('/health', (req, res) => {
     simple_nim: SIMPLE_NIM,
     nim_api_base: NIM_API_BASE,
     reasoning_display: SHOW_REASONING,
-    thinking_mode: ENABLE_THINKING_MODE,
+    nim_force_max_tokens: NIM_FORCE_MAX_TOKENS_ENABLED ? NIM_FORCE_MAX_TOKENS : null,
+    nim_reasoning: getNimReasoningDebug(),
     api_key_configured: Boolean(NIM_API_KEY),
     nim_timeout_ms: NIM_TIMEOUT_MS,
     nim_response_headers_timeout_ms: NIM_RESPONSE_HEADERS_TIMEOUT_MS,
@@ -1776,6 +1844,8 @@ app.get('/debug/recent-requests', (req, res) => {
     retry_enabled: Boolean(r.retry_enabled),
     retry_max_attempts: r.retry_max_attempts ?? null,
     retry_delay_ms: r.retry_delay_ms ?? null,
+    force_max_tokens: r.force_max_tokens ?? null,
+    reasoning_mode: r.reasoning_mode ?? null,
     message_count: r.message_count,
     body_keys: r.body_keys || [],
     requested_max_tokens: r.requested_max_tokens,
@@ -1836,7 +1906,7 @@ app.post('/v1/chat/completions', async (req, res) => {
   const downstreamStreamRequested = Boolean(body.stream);
 
   addRecentRequest({
-    id: requestId, // internal only, not returned by debug endpoint
+    id: requestId,
     started_at: new Date(startedAt).toISOString(),
     status: 'received',
     mode: SIMPLE_NIM ? 'simple' : 'advanced',
@@ -1846,6 +1916,8 @@ app.post('/v1/chat/completions', async (req, res) => {
     retry_enabled: SIMPLE_NIM ? false : NIM_TIMEOUT_RETRY_SWITCH,
     retry_max_attempts: SIMPLE_NIM ? 1 : NIM_TIMEOUT_MAX_RETRIES,
     retry_delay_ms: SIMPLE_NIM ? 0 : NIM_TIMEOUT_RETRY_DELAY_MS,
+    force_max_tokens: NIM_FORCE_MAX_TOKENS_ENABLED ? NIM_FORCE_MAX_TOKENS : null,
+    reasoning_mode: NIM_REASONING_MODE,
     message_count: Array.isArray(body.messages) ? body.messages.length : 0,
     body_keys: safeBodyKeys(body),
     requested_max_tokens:
@@ -2011,7 +2083,13 @@ app.listen(PORT, () => {
   console.log(`NIM API base: ${NIM_API_BASE}`);
   console.log(`Simple mode: ${SIMPLE_NIM ? 'ENABLED' : 'DISABLED'}`);
   console.log(`Reasoning display: ${SHOW_REASONING ? 'ENABLED' : 'DISABLED'}`);
-  console.log(`Thinking mode: ${ENABLE_THINKING_MODE ? 'ENABLED' : 'DISABLED'}`);
+  console.log(
+    `Force max_tokens: ${
+      NIM_FORCE_MAX_TOKENS_ENABLED ? NIM_FORCE_MAX_TOKENS : 'DISABLED'
+    }`
+  );
+  console.log(`NIM reasoning mode: ${NIM_REASONING_MODE}`);
+  console.log(`NIM extra_body: ${JSON.stringify(getNimReasoningExtraBody())}`);
   console.log(`API key configured: ${NIM_API_KEY ? 'YES' : 'NO'}`);
   console.log(`NIM timeout: ${NIM_TIMEOUT_MS} ms`);
   console.log(`NIM response headers timeout: ${NIM_RESPONSE_HEADERS_TIMEOUT_MS} ms`);
