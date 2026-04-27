@@ -29,11 +29,12 @@ const NIM_FORCE_MAX_TOKENS_ENABLED =
   Number.isFinite(NIM_FORCE_MAX_TOKENS) && NIM_FORCE_MAX_TOKENS > 0;
 
 // Reasoning / thinking profile.
-// off  = do not send extra_body
-// fast = non-think / fast
+// off  = send extra_body with thinking=false
+// on   = send extra_body with thinking=true
+// fast = non-think / fast, thinking=false + reasoning_effort=fast
 // high = think high / logical analysis
 // max  = think max / full reasoning extent
-const NIM_REASONING_MODE = String(process.env.NIM_REASONING_MODE || 'high')
+const NIM_REASONING_MODE = String(process.env.NIM_REASONING_MODE || 'true')
   .trim()
   .toLowerCase();
 
@@ -315,6 +316,15 @@ function getNimReasoningExtraBody() {
     return {
       chat_template_kwargs: {
         thinking: false
+      }
+    };
+  }
+
+  // true = explicitly enable thinking, but still send extra_body
+  if (['on', 'enabled', 'enable', 'true', '1'].includes(mode)) {
+    return {
+      chat_template_kwargs: {
+        thinking: true
       }
     };
   }
