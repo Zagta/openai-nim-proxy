@@ -27,8 +27,9 @@ const NIM_TIMEOUT_MS = Number(process.env.NIM_TIMEOUT_MS || 180000);
 const NIM_RESPONSE_HEADERS_TIMEOUT_MS = Number(process.env.NIM_RESPONSE_HEADERS_TIMEOUT_MS || 15000);
 const NIM_FIRST_CHUNK_TIMEOUT_MS = Number(process.env.NIM_FIRST_CHUNK_TIMEOUT_MS || 30000);
 const NIM_STREAM_IDLE_TIMEOUT_MS = Number(process.env.NIM_STREAM_IDLE_TIMEOUT_MS || 20000);
-const NIM_TIMEOUT_HEDGE_SWITCH = /^(1|true|yes|on)$/i.test(String(process.env.NIM_TIMEOUT_HEDGE_SWITCH || 'false'));
-const NIM_HEDGE_DELAY_MS = Number(process.env.NIM_HEDGE_DELAY_MS || 8000);
+const NIM_TIMEOUT_RETRY_SWITCH = /^(1|true|yes|on)$/i.test(String(process.env.NIM_TIMEOUT_RETRY_SWITCH || 'true'));
+const NIM_TIMEOUT_MAX_RETRIES = Number(process.env.NIM_TIMEOUT_MAX_RETRIES || 5);
+const NIM_TIMEOUT_RETRY_DELAY_MS = Number(process.env.NIM_TIMEOUT_RETRY_DELAY_MS || 1500);
 
 const SLOW_REQUEST_MS = Number(process.env.SLOW_REQUEST_MS || 15000);
 
@@ -140,6 +141,9 @@ function contentToString(content) {
   return String(content);
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 function normalizeMessages(messages) {
   if (!Array.isArray(messages)) return [];
 
@@ -293,8 +297,9 @@ app.get('/health', (req, res) => {
     nim_response_headers_timeout_ms: NIM_RESPONSE_HEADERS_TIMEOUT_MS,
     nim_first_chunk_timeout_ms: NIM_FIRST_CHUNK_TIMEOUT_MS,
     nim_stream_idle_timeout_ms: NIM_STREAM_IDLE_TIMEOUT_MS,
-    nim_timeout_hedge_switch: NIM_TIMEOUT_HEDGE_SWITCH,
-    nim_hedge_delay_ms: NIM_HEDGE_DELAY_MS,
+    nim_timeout_retry_switch: NIM_TIMEOUT_RETRY_SWITCH,
+    nim_timeout_max_retries: NIM_TIMEOUT_MAX_RETRIES,
+    nim_timeout_retry_delay_ms: NIM_TIMEOUT_RETRY_DELAY_MS,
     slow_request_ms: SLOW_REQUEST_MS,
     recent_requests_kept: RECENT_REQUESTS_LIMIT
   });
@@ -309,8 +314,9 @@ app.get('/debug/recent-requests', (req, res) => {
     client_model: r.client_model,
     nim_model: r.nim_model,
     stream: r.stream,
-    hedge_enabled: Boolean(r.hedge_enabled),
-    hedge_delay_ms: r.hedge_delay_ms ?? null,
+    retry_enabled: Boolean(r.retry_enabled),
+    retry_max_attempts: r.retry_max_attempts ?? null,
+    retry_delay_ms: r.retry_delay_ms ?? null,
     message_count: r.message_count,
     body_keys: r.body_keys || [],
     requested_max_tokens: r.requested_max_tokens,
@@ -377,8 +383,9 @@ app.post('/v1/chat/completions', async (req, res) => {
     client_model: body.model || null,
     nim_model: null,
     stream: downstreamStreamRequested,
-    hedge_enabled: NIM_TIMEOUT_HEDGE_SWITCH,
-    hedge_delay_ms: NIM_TIMEOUT_HEDGE_SWITCH ? NIM_HEDGE_DELAY_MS : null,
+    retry_enabled: NIM_TIMEOUT_RETRY_SWITCH,
+    retry_max_attempts: NIM_TIMEOUT_MAX_RETRIES,
+    retry_delay_ms: NIM_TIMEOUT_RETRY_DELAY_MS,
     message_count: Array.isArray(body.messages) ? body.messages.length : 0,
     body_keys: safeBodyKeys(body),
     requested_max_tokens:
@@ -531,7 +538,7 @@ app.post('/v1/chat/completions', async (req, res) => {
       }
     });
 
-    const maxAttempts = NIM_TIMEOUT_HEDGE_SWITCH ? 2 : 1;
+    const maxAttempts = NIM_TIMEOUT_RETRY_SWITCH ? Math.max(1, NIM_TIMEOUT_MAX_RETRIES) : 1;
     const state = {
       finalized: false,
       clientStreamRequested: downstreamStreamRequested,
@@ -554,7 +561,6 @@ app.post('/v1/chat/completions', async (req, res) => {
     let absoluteTimer = null;
     let firstChunkTimer = null;
     let idleTimer = null;
-    let hedgeTimer = null;
 
     function snapshotAttempts() {
       return state.attempts.map((attempt) => ({
@@ -586,7 +592,6 @@ app.post('/v1/chat/completions', async (req, res) => {
       clearTimeout(absoluteTimer);
       clearTimeout(firstChunkTimer);
       clearTimeout(idleTimer);
-      clearTimeout(hedgeTimer);
     }
 
     function resetIdleTimer() {
@@ -638,15 +643,7 @@ app.post('/v1/chat/completions', async (req, res) => {
         abortAttempt(attempt, reason);
       }
     }
-
-    function abortLosers(winnerIndex) {
-      for (const attempt of state.attempts) {
-        if (attempt.index !== winnerIndex) {
-          abortAttempt(attempt, 'hedge_loser');
-        }
-      }
-    }
-
+    
     function buildOpenAIResponseFromAggregate() {
       let fullContent = state.aggregate.content;
 
@@ -756,14 +753,19 @@ app.post('/v1/chat/completions', async (req, res) => {
     function maybeFailEarlyIfAllAttemptsDead() {
       if (state.finalized || state.winnerAttempt) return;
 
-      const canStartMore = state.attempts.length < maxAttempts;
       const anyActive = state.attempts.some((attempt) => !attempt.settled && !attempt.aborted);
-
-      if (canStartMore || anyActive) {
-        return;
-      }
-
-      if (state.bestError?.code === 'ECONNABORTED') {
+      if (anyActive) return;
+    
+      const lastAttempt = state.attempts[state.attempts.length - 1];
+      const lastError = lastAttempt?.error || state.bestError;
+    
+      const timedOutOnHeaders = lastError?.code === 'ECONNABORTED';
+      const timedOutBeforeFirstChunk = !lastAttempt?.firstDataAt && lastAttempt?.status === 'aborted' && lastAttempt?.abortReason === 'timeout_before_first_chunk';
+    
+      if (timedOutOnHeaders) {
+        const retried = await retryIfAllowed('response_headers', `Upstream response headers timeout after ${NIM_RESPONSE_HEADERS_TIMEOUT_MS} ms`);
+        if (retried) return;
+    
         finalizeWithError(
           504,
           `Upstream response headers timeout after ${NIM_RESPONSE_HEADERS_TIMEOUT_MS} ms`,
@@ -772,47 +774,73 @@ app.post('/v1/chat/completions', async (req, res) => {
         );
         return;
       }
-
-      if (state.bestError?.response?.status) {
-        let message = 'Upstream request failed';
-        if (state.bestError.response?.data?.error?.message) {
-          message = state.bestError.response.data.error.message;
-        } else if (typeof state.bestError.response?.data === 'string') {
-          message = state.bestError.response.data;
-        } else if (state.bestError.message) {
-          message = state.bestError.message;
-        }
-
+    
+      if (timedOutBeforeFirstChunk) {
+        const retried = await retryIfAllowed('before_first_chunk', `No first stream chunk after ${NIM_FIRST_CHUNK_TIMEOUT_MS} ms`);
+        if (retried) return;
+    
         finalizeWithError(
-          state.bestError.response.status,
-          message,
-          'error',
-          'response_headers'
+          504,
+          `No first stream chunk after ${NIM_FIRST_CHUNK_TIMEOUT_MS} ms`,
+          'timeout',
+          'before_first_chunk'
         );
         return;
       }
-
+    
+      if (lastError?.response?.status) {
+        let message = 'Upstream request failed';
+        if (lastError.response?.data?.error?.message) {
+          message = lastError.response.data.error.message;
+        } else if (typeof lastError.response?.data === 'string') {
+          message = lastError.response.data;
+        } else if (lastError.message) {
+          message = lastError.message;
+        }
+    
+        finalizeWithError(
+          lastError.response.status,
+          message,
+          'error',
+          null
+        );
+        return;
+      }
+    
       finalizeWithError(
         502,
-        state.bestError?.message || 'All upstream attempts failed',
-        isAbortLikeError(state.bestError) ? 'timeout' : 'error',
-        state.bestError?.code === 'ECONNABORTED' ? 'response_headers' : null
+        lastError?.message || 'All upstream attempts failed',
+        isAbortLikeError(lastError) ? 'timeout' : 'error',
+        null
       );
     }
 
-    function maybeStartHedge() {
-      if (!NIM_TIMEOUT_HEDGE_SWITCH) return;
-      if (state.finalized || state.winnerAttempt) return;
-      if (state.attempts.length >= maxAttempts) return;
-      startAttempt(state.attempts.length + 1);
+    async function retryIfAllowed(stage, errorMessage) {
+      if (state.finalized) return false;
+      if (!NIM_TIMEOUT_RETRY_SWITCH) return false;
+      if (state.winnerAttempt) return false; // уже пошёл стрим, retry опасен
+      if (state.attempts.length >= maxAttempts) return false;
+    
+      updateRecentRequest(requestId, {
+        status: 'retrying',
+        timed_out_stage: stage
+      });
+    
+      if (NIM_TIMEOUT_RETRY_DELAY_MS > 0) {
+        await sleep(NIM_TIMEOUT_RETRY_DELAY_MS);
+      }
+    
+      if (state.finalized || state.winnerAttempt) return false;
+    
+      await startAttempt(state.attempts.length + 1);
+      return true;
     }
-
+       
     function onWinnerSelected(attempt) {
       if (state.winnerAttempt) return;
       state.winnerAttempt = attempt.index;
 
       clearTimeout(firstChunkTimer);
-      clearTimeout(hedgeTimer);
 
       updateRecentRequest(requestId, {
         status: 'streaming',
@@ -821,7 +849,6 @@ app.post('/v1/chat/completions', async (req, res) => {
         winner_attempt: attempt.index
       });
 
-      abortLosers(attempt.index);
       updateAttemptsDebug();
       resetIdleTimer();
     }
@@ -1013,7 +1040,7 @@ app.post('/v1/chat/completions', async (req, res) => {
     function startAttempt(index) {
       if (state.finalized) return;
       if (state.attempts.some((a) => a.index === index)) return;
-
+    
       const controller = new AbortController();
       const attempt = {
         index,
@@ -1029,40 +1056,42 @@ app.post('/v1/chat/completions', async (req, res) => {
         status: 'starting',
         error: null
       };
-
+    
       state.attempts.push(attempt);
       updateAttemptsDebug();
-
-      axios.post(
-        `${NIM_API_BASE}/chat/completions`,
-        nimRequest,
-        {
-          headers: {
-            Authorization: `Bearer ${NIM_API_KEY}`,
-            'Content-Type': 'application/json'
-          },
-          responseType: 'stream',
-          timeout: NIM_RESPONSE_HEADERS_TIMEOUT_MS,
-          signal: controller.signal
-        }
-      ).then((response) => {
+    
+      try {
+        const response = await axios.post(
+          `${NIM_API_BASE}/chat/completions`,
+          nimRequest,
+          {
+            headers: {
+              Authorization: `Bearer ${NIM_API_KEY}`,
+              'Content-Type': 'application/json'
+            },
+            responseType: 'stream',
+            timeout: NIM_RESPONSE_HEADERS_TIMEOUT_MS,
+            signal: controller.signal
+          }
+        );
+    
         if (state.finalized || attempt.aborted) {
           safeDestroyStream(response.data);
           return;
         }
-
+    
         attempt.response = response;
         attempt.nimStatus = response.status;
         attempt.headersAt = Date.now();
         attempt.status = 'headers_received';
         updateAttemptsDebug();
-
+    
         response.data.on('data', (chunk) => onAttemptData(attempt, chunk));
         response.data.on('end', () => onAttemptEnd(attempt));
         response.data.on('error', (err) => onAttemptFailure(attempt, err, 'stream'));
-      }).catch((error) => {
+      } catch (error) {
         onAttemptFailure(attempt, error, 'setup');
-      });
+      }
     }
 
     // Global client-close handling
@@ -1084,7 +1113,20 @@ app.post('/v1/chat/completions', async (req, res) => {
     });
 
     // Global timeouts
-    absoluteTimer = setTimeout(() => {
+    absoluteTimer = setTimeout(async () => {
+      if (state.finalized) return;
+    
+      if (!state.winnerAttempt) {
+        const activeAttempt = state.attempts.find((a) => !a.settled && !a.aborted);
+        if (activeAttempt) {
+          activeAttempt.abortReason = 'timeout_absolute';
+          abortAttempt(activeAttempt, 'timeout_absolute');
+        }
+    
+        const retried = await retryIfAllowed('absolute', `Upstream absolute timeout after ${NIM_TIMEOUT_MS} ms`);
+        if (retried) return;
+      }
+    
       finalizeWithError(
         504,
         `Upstream absolute timeout after ${NIM_TIMEOUT_MS} ms`,
@@ -1093,22 +1135,17 @@ app.post('/v1/chat/completions', async (req, res) => {
       );
     }, NIM_TIMEOUT_MS);
 
-    firstChunkTimer = setTimeout(() => {
-      finalizeWithError(
-        504,
-        `No first stream chunk after ${NIM_FIRST_CHUNK_TIMEOUT_MS} ms`,
-        'timeout',
-        'before_first_chunk'
-      );
+    firstChunkTimer = setTimeout(async () => {
+      if (state.finalized || state.winnerAttempt) return;
+    
+      const activeAttempt = state.attempts.find((a) => !a.settled && !a.aborted);
+      if (activeAttempt) {
+        activeAttempt.abortReason = 'timeout_before_first_chunk';
+        abortAttempt(activeAttempt, 'timeout_before_first_chunk');
+      }
+    
+      await maybeFailEarlyIfAllAttemptsDead();
     }, NIM_FIRST_CHUNK_TIMEOUT_MS);
-
-    if (NIM_TIMEOUT_HEDGE_SWITCH) {
-      hedgeTimer = setTimeout(() => {
-        if (!state.finalized && !state.winnerAttempt) {
-          maybeStartHedge();
-        }
-      }, NIM_HEDGE_DELAY_MS);
-    }
 
     // Start first upstream attempt
     startAttempt(1);
@@ -1176,7 +1213,8 @@ app.listen(PORT, () => {
   console.log(`NIM response headers timeout: ${NIM_RESPONSE_HEADERS_TIMEOUT_MS} ms`);
   console.log(`NIM first chunk timeout: ${NIM_FIRST_CHUNK_TIMEOUT_MS} ms`);
   console.log(`NIM stream idle timeout: ${NIM_STREAM_IDLE_TIMEOUT_MS} ms`);
-  console.log(`Hedge enabled: ${NIM_TIMEOUT_HEDGE_SWITCH ? 'YES' : 'NO'}`);
-  console.log(`Hedge delay: ${NIM_HEDGE_DELAY_MS} ms`);
+  console.log(`Retry enabled: ${NIM_TIMEOUT_RETRY_SWITCH ? 'YES' : 'NO'}`);
+  console.log(`Retry max attempts: ${NIM_TIMEOUT_MAX_RETRIES}`);
+  console.log(`Retry delay: ${NIM_TIMEOUT_RETRY_DELAY_MS} ms`);
   console.log(`Slow request threshold: ${SLOW_REQUEST_MS} ms`);
 });
