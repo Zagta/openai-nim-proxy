@@ -8,37 +8,29 @@ const axios = require('axios');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Middleware
 app.use(cors());
 app.use(express.json({ limit: '40mb' }));
 
-// NVIDIA NIM API configuration
 const NIM_API_BASE = process.env.NIM_API_BASE || 'https://integrate.api.nvidia.com/v1';
 const NIM_API_KEY = process.env.NIM_API_KEY;
 
-// Mode switch
 const SIMPLE_NIM = /^(1|true|yes|on)$/i.test(String(process.env.SIMPLE_NIM || 'false'));
-
-// Show/hide reasoning in output
 const SHOW_REASONING = false;
 
-// Force max_tokens override.
-// 0 / unset = do not override client value.
+// Включи в .env: NIM_MANUAL_REMOVE_THINKING=true
+// Тогда из ответа будет удаляться всё между <thinking> и </thinking>.
+const NIM_MANUAL_REMOVE_THINKING = /^(1|true|yes|on)$/i.test(
+  String(process.env.NIM_MANUAL_REMOVE_THINKING || 'false')
+);
+
 const NIM_FORCE_MAX_TOKENS = Number(process.env.NIM_FORCE_MAX_TOKENS || 0);
 const NIM_FORCE_MAX_TOKENS_ENABLED =
   Number.isFinite(NIM_FORCE_MAX_TOKENS) && NIM_FORCE_MAX_TOKENS > 0;
 
-// Reasoning / thinking profile.
-// off  = send extra_body with thinking=false
-// on   = send extra_body with thinking=true
-// fast = non-think / fast, thinking=false + reasoning_effort=fast
-// high = think high / logical analysis
-// max  = think max / full reasoning extent
 const NIM_REASONING_MODE = String(process.env.NIM_REASONING_MODE || 'true')
   .trim()
   .toLowerCase();
 
-// Advanced-mode timeouts / retry / logging config
 const NIM_TIMEOUT_MS = Number(process.env.NIM_TIMEOUT_MS || 200000);
 const NIM_RESPONSE_HEADERS_TIMEOUT_MS = Number(process.env.NIM_RESPONSE_HEADERS_TIMEOUT_MS || 150000);
 const NIM_FIRST_CHUNK_TIMEOUT_MS = Number(process.env.NIM_FIRST_CHUNK_TIMEOUT_MS || 30000);
@@ -51,23 +43,17 @@ const NIM_TIMEOUT_MAX_RETRIES = Number(process.env.NIM_TIMEOUT_MAX_RETRIES || 5)
 const NIM_TIMEOUT_RETRY_DELAY_MS = Number(process.env.NIM_TIMEOUT_RETRY_DELAY_MS || 1500);
 
 const SLOW_REQUEST_MS = Number(process.env.SLOW_REQUEST_MS || 15000);
-
 const RECENT_REQUESTS_LIMIT = 5;
 const recentRequests = [];
 
-const NIM_PLAYGROUND_MODEL_NAME = String(process.env.NIM_PLAYGROUND_MODEL_NAME)
+const NIM_PLAYGROUND_MODEL_NAME = String(process.env.NIM_PLAYGROUND_MODEL_NAME || '');
 
-// Model mapping
 const MODEL_MAPPING = {
   'gpt-3.5-turbo': 'mistralai/mistral-medium-3.5-128b',
-
-  // DeepSeek aliases
   'gpt-4': 'deepseek-ai/deepseek-v4-flash',
   'gpt-4-turbo': 'deepseek-ai/deepseek-v4-pro',
-  
   'claude-3-opus': 'nvidia/nemotron-3-super-120b-a12b',
   'claude-3-sonnet': 'openai/gpt-oss-20b',
-  
   'gpt-4o': NIM_PLAYGROUND_MODEL_NAME
 };
 
@@ -106,36 +92,21 @@ function sleep(ms) {
 
 function contentToString(content) {
   if (content == null) return '';
-
-  if (typeof content === 'string') {
-    return content;
-  }
+  if (typeof content === 'string') return content;
 
   if (Array.isArray(content)) {
     return content
       .map((part) => {
         if (part == null) return '';
-
-        if (typeof part === 'string') {
-          return part;
-        }
+        if (typeof part === 'string') return part;
 
         if (typeof part === 'object') {
           if ((part.type === 'text' || part.type === 'input_text') && typeof part.text === 'string') {
             return part.text;
           }
-
-          if (typeof part.text === 'string') {
-            return part.text;
-          }
-
-          if (typeof part.content === 'string') {
-            return part.content;
-          }
-
-          if (Array.isArray(part.content)) {
-            return contentToString(part.content);
-          }
+          if (typeof part.text === 'string') return part.text;
+          if (typeof part.content === 'string') return part.content;
+          if (Array.isArray(part.content)) return contentToString(part.content);
         }
 
         return '';
@@ -144,17 +115,9 @@ function contentToString(content) {
   }
 
   if (typeof content === 'object') {
-    if (typeof content.text === 'string') {
-      return content.text;
-    }
-
-    if (Array.isArray(content.content)) {
-      return contentToString(content.content);
-    }
-
-    if (typeof content.content === 'string') {
-      return content.content;
-    }
+    if (typeof content.text === 'string') return content.text;
+    if (Array.isArray(content.content)) return contentToString(content.content);
+    if (typeof content.content === 'string') return content.content;
 
     try {
       return JSON.stringify(content);
@@ -166,49 +129,101 @@ function contentToString(content) {
   return String(content);
 }
 
+function removeThinkingBlocksFromText(value) {
+  const text = contentToString(value);
+  if (!NIM_MANUAL_REMOVE_THINKING || !text) return text;
+
+  return text
+    .replace(/<think\b[^>]*>[\s\S]*?<\/think>/gi, '')
+    .replace(/<think\b[^>]*>[\s\S]*$/gi, '')
+    .replace(/<\/think>/gi, '');
+}
+
+function createThinkingRemovalState() {
+  return {
+    insideThinking: false,
+    pending: ''
+  };
+}
+
+function removeThinkingBlocksFromStreamChunk(value, state) {
+  const text = contentToString(value);
+  if (!NIM_MANUAL_REMOVE_THINKING || !text) return text;
+
+  const OPEN_RE = /<thinking\b[^>]*>/i;
+  const CLOSE_RE = /<\/thinking>/i;
+  const KEEP_TAIL = '</thinking>'.length - 1;
+
+  state.pending += text;
+  let output = '';
+
+  while (state.pending.length > 0) {
+    if (state.insideThinking) {
+      const closeMatch = state.pending.match(CLOSE_RE);
+      if (!closeMatch || closeMatch.index == null) {
+        state.pending = state.pending.slice(-KEEP_TAIL);
+        return output;
+      }
+
+      state.pending = state.pending.slice(closeMatch.index + closeMatch[0].length);
+      state.insideThinking = false;
+      continue;
+    }
+
+    const openMatch = state.pending.match(OPEN_RE);
+    if (!openMatch || openMatch.index == null) {
+      if (state.pending.length <= '<thinking>'.length) return output;
+      output += state.pending.slice(0, -'<thinking>'.length);
+      state.pending = state.pending.slice(-'<thinking>'.length);
+      return output;
+    }
+
+    output += state.pending.slice(0, openMatch.index);
+    state.pending = state.pending.slice(openMatch.index + openMatch[0].length);
+    state.insideThinking = true;
+  }
+
+  return output;
+}
+
+function flushThinkingRemovalState(state) {
+  if (!NIM_MANUAL_REMOVE_THINKING || !state) return '';
+  if (state.insideThinking) {
+    state.pending = '';
+    state.insideThinking = false;
+    return '';
+  }
+
+  const rest = state.pending || '';
+  state.pending = '';
+  return rest;
+}
+
 function normalizeMessages(messages) {
   if (!Array.isArray(messages)) return [];
 
-  return messages.map((msg) => {
-    const role = msg?.role === 'developer' ? 'system' : msg?.role;
-
-    const normalized = {
-      ...msg,
-      role,
-      content: contentToString(msg?.content)
-    };
-
-    if (normalized.content == null) {
-      normalized.content = '';
-    }
-
-    return normalized;
-  });
+  return messages.map((msg) => ({
+    ...msg,
+    role: msg?.role === 'developer' ? 'system' : msg?.role,
+    content: contentToString(msg?.content)
+  }));
 }
 
 function pickDefined(source, keys) {
   const out = {};
   for (const key of keys) {
-    if (source[key] !== undefined) {
-      out[key] = source[key];
-    }
+    if (source[key] !== undefined) out[key] = source[key];
   }
   return out;
 }
 
 function sanitizeDebugValue(key, value) {
   if (value === undefined) return undefined;
-
-  if (key === 'user') {
-    return value == null ? value : '[present]';
-  }
+  if (key === 'user') return value == null ? value : '[present]';
 
   if (key === 'stop') {
     if (typeof value === 'string') {
-      return {
-        type: 'string',
-        length: value.length
-      };
+      return { type: 'string', length: value.length };
     }
 
     if (Array.isArray(value)) {
@@ -228,18 +243,13 @@ function sanitizeDebugValue(key, value) {
 function sanitizeDebugObject(source, keys) {
   const out = {};
   for (const key of keys) {
-    if (source[key] !== undefined) {
-      out[key] = sanitizeDebugValue(key, source[key]);
-    }
+    if (source[key] !== undefined) out[key] = sanitizeDebugValue(key, source[key]);
   }
   return out;
 }
 
 function safeBodyKeys(body) {
-  if (!body || typeof body !== 'object' || Array.isArray(body)) {
-    return [];
-  }
-
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return [];
   return Object.keys(body).sort();
 }
 
@@ -255,9 +265,7 @@ function createOpenAIError(status, message, type = 'invalid_request_error') {
 
 function addRecentRequest(entry) {
   recentRequests.unshift(entry);
-  if (recentRequests.length > RECENT_REQUESTS_LIMIT) {
-    recentRequests.length = RECENT_REQUESTS_LIMIT;
-  }
+  if (recentRequests.length > RECENT_REQUESTS_LIMIT) recentRequests.length = RECENT_REQUESTS_LIMIT;
 }
 
 function updateRecentRequest(id, patch) {
@@ -288,9 +296,7 @@ function logRequestSummary(record) {
 
 function safeDestroyStream(stream) {
   try {
-    if (stream?.destroy) {
-      stream.destroy();
-    }
+    if (stream?.destroy) stream.destroy();
   } catch {
     // ignore
   }
@@ -306,32 +312,17 @@ function openAIErrorTypeByStatus(status, fallback = 'api_error') {
   return fallback;
 }
 
-// off  = send extra_body with thinking=false
-// fast = non-think / fast, thinking=false + reasoning_effort=fast
-// high = think high / logical analysis
-// max  = think max / full reasoning extent
 function getNimReasoningExtraBody() {
   const mode = NIM_REASONING_MODE;
 
-  // off = explicitly disable thinking, but still send extra_body
   if (['off', 'none', 'disabled', 'disable', 'false', '0'].includes(mode)) {
-    return {
-      chat_template_kwargs: {
-        thinking: false
-      }
-    };
+    return { chat_template_kwargs: { thinking: false } };
   }
 
-  // true = explicitly enable thinking, but still send extra_body
   if (['on', 'enabled', 'enable', 'true', '1'].includes(mode)) {
-    return {
-      chat_template_kwargs: {
-        thinking: true
-      }
-    };
+    return { chat_template_kwargs: { thinking: true } };
   }
 
-  // fast = non-think / fast, with explicit reasoning_effort
   if (['fast', 'non-think', 'non_think', 'nonthink', 'no-think', 'no_think'].includes(mode)) {
     return {
       chat_template_kwargs: {
@@ -341,7 +332,6 @@ function getNimReasoningExtraBody() {
     };
   }
 
-  // high = think high / logical analysis
   if (['high', 'think-high', 'think_high', 'logical', 'analysis'].includes(mode)) {
     return {
       chat_template_kwargs: {
@@ -351,7 +341,6 @@ function getNimReasoningExtraBody() {
     };
   }
 
-  // max = think max / full reasoning extent
   if (['max', 'think-max', 'think_max', 'full', 'full-reasoning', 'full_reasoning'].includes(mode)) {
     return {
       chat_template_kwargs: {
@@ -361,7 +350,6 @@ function getNimReasoningExtraBody() {
     };
   }
 
-  // Safe fallback
   return {
     chat_template_kwargs: {
       thinking: true,
@@ -372,7 +360,6 @@ function getNimReasoningExtraBody() {
 
 function getNimReasoningDebug() {
   const extraBody = getNimReasoningExtraBody();
-
   return {
     mode: NIM_REASONING_MODE,
     extra_body_enabled: Boolean(extraBody),
@@ -387,7 +374,7 @@ function makeOpenAIResponseFromSourceData(sourceData, clientModel) {
     created: sourceData.created || Math.floor(Date.now() / 1000),
     model: clientModel,
     choices: (sourceData.choices || []).map((choice) => {
-      let fullContent = contentToString(choice?.message?.content);
+      let fullContent = removeThinkingBlocksFromText(choice?.message?.content);
       const reasoningText = contentToString(choice?.message?.reasoning_content);
 
       if (SHOW_REASONING && reasoningText) {
@@ -411,14 +398,13 @@ function makeOpenAIResponseFromSourceData(sourceData, clientModel) {
   };
 }
 
-function rewriteStreamingDataForClient(data, reasoningState) {
-  if (!data?.choices?.[0]?.delta) {
-    return data;
-  }
+function rewriteStreamingDataForClient(data, reasoningState, thinkingRemovalState) {
+  if (!data?.choices?.[0]?.delta) return data;
 
   const delta = data.choices[0].delta;
   const reasoning = contentToString(delta.reasoning_content);
-  const content = contentToString(delta.content);
+  const rawContent = contentToString(delta.content);
+  const content = removeThinkingBlocksFromStreamChunk(rawContent, thinkingRemovalState);
 
   if (SHOW_REASONING) {
     let combinedContent = '';
@@ -472,9 +458,7 @@ async function resolveNimModel(model) {
         }
       );
 
-      if (probe.status >= 200 && probe.status < 300) {
-        nimModel = model;
-      }
+      if (probe.status >= 200 && probe.status < 300) nimModel = model;
     } catch {
       // ignore and fallback below
     }
@@ -482,17 +466,9 @@ async function resolveNimModel(model) {
     if (!nimModel) {
       const modelLower = String(model).toLowerCase();
 
-      if (
-        modelLower.includes('gpt-4') ||
-        modelLower.includes('claude-opus') ||
-        modelLower.includes('405b')
-      ) {
+      if (modelLower.includes('gpt-4') || modelLower.includes('claude-opus') || modelLower.includes('405b')) {
         nimModel = 'meta/llama-3.1-405b-instruct';
-      } else if (
-        modelLower.includes('claude') ||
-        modelLower.includes('gemini') ||
-        modelLower.includes('70b')
-      ) {
+      } else if (modelLower.includes('claude') || modelLower.includes('gemini') || modelLower.includes('70b')) {
         nimModel = 'meta/llama-3.1-70b-instruct';
       } else {
         nimModel = 'meta/llama-3.1-8b-instruct';
@@ -511,10 +487,7 @@ function buildNimRequest(body, nimModel, normalizedMessages, streamValue) {
         ? body.max_completion_tokens
         : 64000;
 
-  const effectiveMaxTokens = NIM_FORCE_MAX_TOKENS_ENABLED
-    ? NIM_FORCE_MAX_TOKENS
-    : clientMaxTokens;
-
+  const effectiveMaxTokens = NIM_FORCE_MAX_TOKENS_ENABLED ? NIM_FORCE_MAX_TOKENS : clientMaxTokens;
   const forwardedOptions = pickDefined(body, NIM_FORWARD_OPTION_KEYS);
 
   const nimRequest = {
@@ -525,31 +498,30 @@ function buildNimRequest(body, nimModel, normalizedMessages, streamValue) {
     ...forwardedOptions
   };
 
-  // Ensure force max_tokens always wins.
   nimRequest.max_tokens = effectiveMaxTokens;
 
-  if (nimRequest.temperature === undefined) {
-    nimRequest.temperature = 0.7;
-  }
+  if (nimRequest.temperature === undefined) nimRequest.temperature = 0.7;
 
   const forcedExtraBody = getNimReasoningExtraBody();
-  if (forcedExtraBody) {
-    nimRequest.extra_body = forcedExtraBody;
-  }
+  if (forcedExtraBody) nimRequest.extra_body = forcedExtraBody;
 
   return nimRequest;
 }
 
-async function handleSimpleNimMode({
-  req,
-  res,
-  body,
-  requestId,
-  startedAt,
-  model,
-  nimModel,
-  nimRequest
-}) {
+function writeSse(res, data) {
+  res.write(`data: ${JSON.stringify(data)}\n\n`);
+}
+
+function ensureStreamHeaders(res) {
+  if (res.headersSent) return;
+  res.status(200);
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  if (typeof res.flushHeaders === 'function') res.flushHeaders();
+}
+
+async function handleSimpleNimMode({ req, res, body, requestId, startedAt, model, nimModel, nimRequest }) {
   const downstreamStreamRequested = Boolean(body.stream);
 
   if (downstreamStreamRequested) {
@@ -557,19 +529,16 @@ async function handleSimpleNimMode({
     let firstChunkAt = null;
     let buffer = '';
     const reasoningState = { started: false };
+    const thinkingRemovalState = createThinkingRemovalState();
 
     try {
-      const response = await axios.post(
-        `${NIM_API_BASE}/chat/completions`,
-        nimRequest,
-        {
-          headers: {
-            Authorization: `Bearer ${NIM_API_KEY}`,
-            'Content-Type': 'application/json'
-          },
-          responseType: 'stream'
-        }
-      );
+      const response = await axios.post(`${NIM_API_BASE}/chat/completions`, nimRequest, {
+        headers: {
+          Authorization: `Bearer ${NIM_API_KEY}`,
+          'Content-Type': 'application/json'
+        },
+        responseType: 'stream'
+      });
 
       const finalize = (patch) => {
         if (finalized) return;
@@ -577,13 +546,7 @@ async function handleSimpleNimMode({
         finalizeRecentRequest(requestId, patch);
       };
 
-      res.status(200);
-      res.setHeader('Content-Type', 'text/event-stream');
-      res.setHeader('Cache-Control', 'no-cache');
-      res.setHeader('Connection', 'keep-alive');
-      if (typeof res.flushHeaders === 'function') {
-        res.flushHeaders();
-      }
+      ensureStreamHeaders(res);
 
       res.on('close', () => {
         if (finalized || res.writableEnded) return;
@@ -632,14 +595,24 @@ async function handleSimpleNimMode({
           if (!line.startsWith('data: ')) continue;
 
           if (line.includes('[DONE]')) {
+            const flushed = flushThinkingRemovalState(thinkingRemovalState);
+            if (flushed) {
+              writeSse(res, {
+                id: `chatcmpl-${Date.now()}`,
+                object: 'chat.completion.chunk',
+                created: Math.floor(Date.now() / 1000),
+                model,
+                choices: [{ index: 0, delta: { content: flushed }, finish_reason: null }]
+              });
+            }
             res.write('data: [DONE]\n\n');
             continue;
           }
 
           try {
             const data = JSON.parse(line.slice(6));
-            rewriteStreamingDataForClient(data, reasoningState);
-            res.write(`data: ${JSON.stringify(data)}\n\n`);
+            rewriteStreamingDataForClient(data, reasoningState, thinkingRemovalState);
+            writeSse(res, data);
           } catch {
             res.write(line + '\n\n');
           }
@@ -652,13 +625,24 @@ async function handleSimpleNimMode({
           if (line.startsWith('data: ') && !line.includes('[DONE]')) {
             try {
               const data = JSON.parse(line.slice(6));
-              rewriteStreamingDataForClient(data, reasoningState);
-              res.write(`data: ${JSON.stringify(data)}\n\n`);
+              rewriteStreamingDataForClient(data, reasoningState, thinkingRemovalState);
+              writeSse(res, data);
             } catch {
               res.write(line + '\n\n');
             }
           }
           buffer = '';
+        }
+
+        const flushed = flushThinkingRemovalState(thinkingRemovalState);
+        if (flushed) {
+          writeSse(res, {
+            id: `chatcmpl-${Date.now()}`,
+            object: 'chat.completion.chunk',
+            created: Math.floor(Date.now() / 1000),
+            model,
+            choices: [{ index: 0, delta: { content: flushed }, finish_reason: null }]
+          });
         }
 
         finalize({
@@ -671,20 +655,20 @@ async function handleSimpleNimMode({
           choice_count: 1
         });
 
-        logRequestSummary(getRequestLogById(requestId) || {
-          id: requestId,
-          status: 'completed',
-          mode: 'simple',
-          client_model: model,
-          nim_model: nimModel,
-          duration_ms: Date.now() - startedAt,
-          attempt_count: 1,
-          winner_attempt: firstChunkAt ? 1 : null
-        });
+        logRequestSummary(
+          getRequestLogById(requestId) || {
+            id: requestId,
+            status: 'completed',
+            mode: 'simple',
+            client_model: model,
+            nim_model: nimModel,
+            duration_ms: Date.now() - startedAt,
+            attempt_count: 1,
+            winner_attempt: firstChunkAt ? 1 : null
+          }
+        );
 
-        if (!res.writableEnded) {
-          res.end();
-        }
+        if (!res.writableEnded) res.end();
       });
 
       response.data.on('error', (err) => {
@@ -699,10 +683,7 @@ async function handleSimpleNimMode({
         });
 
         console.error(`[${requestId}] Stream error:`, err.message);
-
-        if (!res.writableEnded) {
-          res.end();
-        }
+        if (!res.writableEnded) res.end();
       });
 
       return;
@@ -727,24 +708,18 @@ async function handleSimpleNimMode({
         winner_attempt: null
       });
 
-      return res
-        .status(status)
-        .json(createOpenAIError(status, message, openAIErrorTypeByStatus(status)));
+      return res.status(status).json(createOpenAIError(status, message, openAIErrorTypeByStatus(status)));
     }
   }
 
   try {
-    const response = await axios.post(
-      `${NIM_API_BASE}/chat/completions`,
-      nimRequest,
-      {
-        headers: {
-          Authorization: `Bearer ${NIM_API_KEY}`,
-          'Content-Type': 'application/json'
-        },
-        responseType: 'json'
-      }
-    );
+    const response = await axios.post(`${NIM_API_BASE}/chat/completions`, nimRequest, {
+      headers: {
+        Authorization: `Bearer ${NIM_API_KEY}`,
+        'Content-Type': 'application/json'
+      },
+      responseType: 'json'
+    });
 
     const sourceData = response.data || {};
     const openaiResponse = makeOpenAIResponseFromSourceData(sourceData, model);
@@ -759,16 +734,18 @@ async function handleSimpleNimMode({
       winner_attempt: 1
     });
 
-    logRequestSummary(getRequestLogById(requestId) || {
-      id: requestId,
-      status: 'completed',
-      mode: 'simple',
-      client_model: model,
-      nim_model: nimModel,
-      duration_ms: Date.now() - startedAt,
-      attempt_count: 1,
-      winner_attempt: 1
-    });
+    logRequestSummary(
+      getRequestLogById(requestId) || {
+        id: requestId,
+        status: 'completed',
+        mode: 'simple',
+        client_model: model,
+        nim_model: nimModel,
+        duration_ms: Date.now() - startedAt,
+        attempt_count: 1,
+        winner_attempt: 1
+      }
+    );
 
     return res.json(openaiResponse);
   } catch (error) {
@@ -792,22 +769,23 @@ async function handleSimpleNimMode({
       winner_attempt: null
     });
 
-    return res
-      .status(status)
-      .json(createOpenAIError(status, message, openAIErrorTypeByStatus(status)));
+    return res.status(status).json(createOpenAIError(status, message, openAIErrorTypeByStatus(status)));
   }
 }
 
-async function handleAdvancedNimMode({
-  req,
-  res,
-  body,
-  requestId,
-  startedAt,
-  model,
-  nimModel,
-  nimRequest
-}) {
+async function requestNimStreamOnce(nimRequest, timeoutMs, signal) {
+  return axios.post(`${NIM_API_BASE}/chat/completions`, nimRequest, {
+    headers: {
+      Authorization: `Bearer ${NIM_API_KEY}`,
+      'Content-Type': 'application/json'
+    },
+    responseType: 'stream',
+    timeout: timeoutMs,
+    signal
+  });
+}
+
+async function handleAdvancedNimMode({ req, res, body, requestId, startedAt, model, nimModel, nimRequest }) {
   const downstreamStreamRequested = Boolean(body.stream);
 
   const state = {
@@ -820,6 +798,7 @@ async function handleAdvancedNimMode({
     activeController: null,
     activeStream: null,
     reasoningStarted: false,
+    thinkingRemovalState: createThinkingRemovalState(),
     aggregate: {
       id: null,
       created: null,
@@ -887,18 +866,11 @@ async function handleAdvancedNimMode({
     if (!state.clientStreamRequested || state.clientHeadersSent) return;
 
     state.clientHeadersSent = true;
-    res.status(200);
-    res.setHeader('Content-Type', 'text/event-stream');
-    res.setHeader('Cache-Control', 'no-cache');
-    res.setHeader('Connection', 'keep-alive');
-
-    if (typeof res.flushHeaders === 'function') {
-      res.flushHeaders();
-    }
+    ensureStreamHeaders(res);
   }
 
   function buildOpenAIResponseFromAggregate() {
-    let fullContent = state.aggregate.content;
+    let fullContent = removeThinkingBlocksFromText(state.aggregate.content);
 
     if (SHOW_REASONING && state.aggregate.reasoning) {
       fullContent = `<think>\n${state.aggregate.reasoning}\n</think>\n\n${fullContent}`;
@@ -945,21 +917,32 @@ async function handleAdvancedNimMode({
       winner_attempt: state.winnerAttempt
     });
 
-    logRequestSummary(getRequestLogById(requestId) || {
-      id: requestId,
-      status: 'completed',
-      mode: 'advanced',
-      client_model: model,
-      nim_model: nimModel,
-      duration_ms: durationMs,
-      attempt_count: state.attempts.length,
-      winner_attempt: state.winnerAttempt
-    });
+    logRequestSummary(
+      getRequestLogById(requestId) || {
+        id: requestId,
+        status: 'completed',
+        mode: 'advanced',
+        client_model: model,
+        nim_model: nimModel,
+        duration_ms: durationMs,
+        attempt_count: state.attempts.length,
+        winner_attempt: state.winnerAttempt
+      }
+    );
 
     if (state.clientStreamRequested) {
-      if (!res.writableEnded) {
-        res.end();
+      const flushed = flushThinkingRemovalState(state.thinkingRemovalState);
+      if (flushed && !res.writableEnded) {
+        ensureClientStreamHeaders();
+        writeSse(res, {
+          id: state.aggregate.id || `chatcmpl-${Date.now()}`,
+          object: 'chat.completion.chunk',
+          created: state.aggregate.created || Math.floor(Date.now() / 1000),
+          model,
+          choices: [{ index: 0, delta: { content: flushed }, finish_reason: null }]
+        });
       }
+      if (!res.writableEnded) res.end();
       return;
     }
 
@@ -997,26 +980,26 @@ async function handleAdvancedNimMode({
       return;
     }
 
-    res
-      .status(status)
-      .json(
-        createOpenAIError(
-          status,
-          message,
-          errorStatus === 'timeout' ? 'timeout_error' : openAIErrorTypeByStatus(status)
-        )
-      );
+    res.status(status).json(
+      createOpenAIError(
+        status,
+        message,
+        errorStatus === 'timeout' ? 'timeout_error' : openAIErrorTypeByStatus(status)
+      )
+    );
 
-    logRequestSummary(getRequestLogById(requestId) || {
-      id: requestId,
-      status: errorStatus,
-      mode: 'advanced',
-      client_model: model,
-      nim_model: nimModel,
-      duration_ms: durationMs,
-      attempt_count: state.attempts.length,
-      winner_attempt: state.winnerAttempt
-    });
+    logRequestSummary(
+      getRequestLogById(requestId) || {
+        id: requestId,
+        status: errorStatus,
+        mode: 'advanced',
+        client_model: model,
+        nim_model: nimModel,
+        duration_ms: durationMs,
+        attempt_count: state.attempts.length,
+        winner_attempt: state.winnerAttempt
+      }
+    );
   }
 
   function processWinnerLine(line) {
@@ -1026,6 +1009,18 @@ async function handleAdvancedNimMode({
 
     if (payload.includes('[DONE]')) {
       if (state.clientStreamRequested) {
+        const flushed = flushThinkingRemovalState(state.thinkingRemovalState);
+        if (flushed) {
+          ensureClientStreamHeaders();
+          writeSse(res, {
+            id: state.aggregate.id || `chatcmpl-${Date.now()}`,
+            object: 'chat.completion.chunk',
+            created: state.aggregate.created || Math.floor(Date.now() / 1000),
+            model,
+            choices: [{ index: 0, delta: { content: flushed }, finish_reason: null }]
+          });
+        }
+
         ensureClientStreamHeaders();
         res.write('data: [DONE]\n\n');
       }
@@ -1035,39 +1030,22 @@ async function handleAdvancedNimMode({
     try {
       const data = JSON.parse(payload);
 
-      if (data.id && !state.aggregate.id) {
-        state.aggregate.id = data.id;
-      }
-
-      if (data.created && !state.aggregate.created) {
-        state.aggregate.created = data.created;
-      }
-
-      if (data.usage) {
-        state.aggregate.usage = data.usage;
-      }
+      if (data.id && !state.aggregate.id) state.aggregate.id = data.id;
+      if (data.created && !state.aggregate.created) state.aggregate.created = data.created;
+      if (data.usage) state.aggregate.usage = data.usage;
 
       const choice = data.choices?.[0];
-      if (choice?.finish_reason) {
-        state.aggregate.finishReason = choice.finish_reason;
-      }
+      if (choice?.finish_reason) state.aggregate.finishReason = choice.finish_reason;
 
       if (choice?.delta) {
         const delta = choice.delta;
         const reasoning = contentToString(delta.reasoning_content);
-        const content = contentToString(delta.content);
+        const rawContent = contentToString(delta.content);
+        const content = removeThinkingBlocksFromStreamChunk(rawContent, state.thinkingRemovalState);
 
-        if (reasoning) {
-          state.aggregate.reasoning += reasoning;
-        }
-
-        if (content) {
-          state.aggregate.content += content;
-        }
-
-        if (choice.delta.role) {
-          state.aggregate.role = choice.delta.role;
-        }
+        if (reasoning) state.aggregate.reasoning += reasoning;
+        if (rawContent) state.aggregate.content += rawContent;
+        if (delta.role) state.aggregate.role = delta.role;
 
         if (state.clientStreamRequested) {
           if (SHOW_REASONING) {
@@ -1095,11 +1073,11 @@ async function handleAdvancedNimMode({
           }
 
           ensureClientStreamHeaders();
-          res.write(`data: ${JSON.stringify(data)}\n\n`);
+          writeSse(res, data);
         }
       } else if (state.clientStreamRequested) {
         ensureClientStreamHeaders();
-        res.write(`data: ${JSON.stringify(data)}\n\n`);
+        writeSse(res, data);
       }
     } catch {
       if (state.clientStreamRequested) {
@@ -1146,25 +1124,10 @@ async function handleAdvancedNimMode({
       };
     }
 
-    const headerTimeoutMs = Math.max(
-      1,
-      Math.min(NIM_RESPONSE_HEADERS_TIMEOUT_MS, absoluteRemainingAtStart)
-    );
+    const headerTimeoutMs = Math.max(1, Math.min(NIM_RESPONSE_HEADERS_TIMEOUT_MS, absoluteRemainingAtStart));
 
     try {
-      const response = await axios.post(
-        `${NIM_API_BASE}/chat/completions`,
-        nimRequest,
-        {
-          headers: {
-            Authorization: `Bearer ${NIM_API_KEY}`,
-            'Content-Type': 'application/json'
-          },
-          responseType: 'stream',
-          timeout: headerTimeoutMs,
-          signal: attempt.controller.signal
-        }
-      );
+      const response = await requestNimStreamOnce(nimRequest, headerTimeoutMs, attempt.controller.signal);
 
       if (state.clientClosed || state.finalized) {
         safeDestroyStream(response.data);
@@ -1196,10 +1159,7 @@ async function handleAdvancedNimMode({
         };
       }
 
-      const firstChunkTimeoutMs = Math.max(
-        1,
-        Math.min(NIM_FIRST_CHUNK_TIMEOUT_MS, absoluteRemainingForFirstChunk)
-      );
+      const firstChunkTimeoutMs = Math.max(1, Math.min(NIM_FIRST_CHUNK_TIMEOUT_MS, absoluteRemainingForFirstChunk));
 
       return await new Promise((resolve) => {
         let settled = false;
@@ -1215,15 +1175,12 @@ async function handleAdvancedNimMode({
         const firstChunkTimer = setTimeout(() => {
           if (settled) return;
           settled = true;
-
           cleanup();
 
           attempt.status = 'aborted';
           attempt.aborted = true;
           attempt.abortReason =
-            firstChunkTimeoutMs < NIM_FIRST_CHUNK_TIMEOUT_MS
-              ? 'timeout_absolute'
-              : 'timeout_before_first_chunk';
+            firstChunkTimeoutMs < NIM_FIRST_CHUNK_TIMEOUT_MS ? 'timeout_absolute' : 'timeout_before_first_chunk';
           attempt.settled = true;
 
           try {
@@ -1252,7 +1209,6 @@ async function handleAdvancedNimMode({
         const onData = (chunk) => {
           if (settled) return;
           settled = true;
-
           cleanup();
 
           attempt.firstDataAt = Date.now();
@@ -1260,38 +1216,25 @@ async function handleAdvancedNimMode({
           updateAttemptsDebug();
 
           stream.pause();
-
-          resolve({
-            type: 'first_chunk',
-            attempt,
-            response,
-            firstChunk: chunk
-          });
+          resolve({ type: 'first_chunk', attempt, response, firstChunk: chunk });
         };
 
         const onEnd = () => {
           if (settled) return;
           settled = true;
-
           cleanup();
 
           attempt.status = 'completed';
           attempt.settled = true;
           updateAttemptsDebug();
 
-          resolve({
-            type: 'ended_before_first_chunk',
-            attempt,
-            message: 'Upstream stream ended before first chunk'
-          });
+          resolve({ type: 'ended_before_first_chunk', attempt, message: 'Upstream stream ended before first chunk' });
         };
 
         const onError = (error) => {
           if (settled) return;
           settled = true;
-
           cleanup();
-
           attempt.settled = true;
 
           if (state.clientClosed) {
@@ -1299,7 +1242,6 @@ async function handleAdvancedNimMode({
             attempt.aborted = true;
             attempt.abortReason = 'client_closed';
             updateAttemptsDebug();
-
             resolve({ type: 'client_closed', attempt });
             return;
           }
@@ -1308,7 +1250,6 @@ async function handleAdvancedNimMode({
             attempt.status = 'aborted';
             attempt.aborted = true;
             updateAttemptsDebug();
-
             resolve({
               type: 'timeout',
               stage: 'before_first_chunk',
@@ -1323,7 +1264,6 @@ async function handleAdvancedNimMode({
             attempt.status = 'aborted';
             attempt.aborted = true;
             updateAttemptsDebug();
-
             resolve({
               type: 'timeout',
               stage: 'absolute',
@@ -1339,23 +1279,14 @@ async function handleAdvancedNimMode({
             attempt.aborted = true;
             attempt.abortReason = attempt.abortReason || 'aborted';
             updateAttemptsDebug();
-
-            resolve({
-              type: attempt.abortReason === 'client_closed' ? 'client_closed' : 'aborted',
-              attempt
-            });
+            resolve({ type: attempt.abortReason === 'client_closed' ? 'client_closed' : 'aborted', attempt });
             return;
           }
 
           attempt.status = 'error';
           attempt.error = error;
           updateAttemptsDebug();
-
-          resolve({
-            type: 'error_before_first_chunk',
-            attempt,
-            error
-          });
+          resolve({ type: 'error_before_first_chunk', attempt, error });
         };
 
         stream.on('data', onData);
@@ -1370,7 +1301,6 @@ async function handleAdvancedNimMode({
         attempt.aborted = true;
         attempt.abortReason = 'client_closed';
         updateAttemptsDebug();
-
         return { type: 'client_closed', attempt };
       }
 
@@ -1379,11 +1309,7 @@ async function handleAdvancedNimMode({
         attempt.aborted = true;
         attempt.error = error;
 
-        const stage =
-          headerTimeoutMs < NIM_RESPONSE_HEADERS_TIMEOUT_MS
-            ? 'absolute'
-            : 'response_headers';
-
+        const stage = headerTimeoutMs < NIM_RESPONSE_HEADERS_TIMEOUT_MS ? 'absolute' : 'response_headers';
         updateAttemptsDebug();
 
         return {
@@ -1403,34 +1329,20 @@ async function handleAdvancedNimMode({
         attempt.aborted = true;
         attempt.abortReason = attempt.abortReason || 'aborted';
         updateAttemptsDebug();
-
-        return {
-          type: state.clientClosed ? 'client_closed' : 'aborted',
-          attempt
-        };
+        return { type: state.clientClosed ? 'client_closed' : 'aborted', attempt };
       }
 
       if (error.response?.status) {
         attempt.status = 'error';
         attempt.error = error;
         updateAttemptsDebug();
-
-        return {
-          type: 'http_error',
-          attempt,
-          error
-        };
+        return { type: 'http_error', attempt, error };
       }
 
       attempt.status = 'error';
       attempt.error = error;
       updateAttemptsDebug();
-
-      return {
-        type: 'error_before_first_chunk',
-        attempt,
-        error
-      };
+      return { type: 'error_before_first_chunk', attempt, error };
     }
   }
 
@@ -1457,8 +1369,7 @@ async function handleAdvancedNimMode({
       buffer = lines.pop() || '';
 
       for (const rawLine of lines) {
-        const line = rawLine.trimEnd();
-        processWinnerLine(line);
+        processWinnerLine(rawLine.trimEnd());
       }
     };
 
@@ -1491,28 +1402,17 @@ async function handleAdvancedNimMode({
 
           safeDestroyStream(stream);
           updateAttemptsDebug();
-
-          resolve({
-            type: 'absolute_timeout',
-            attempt
-          });
+          resolve({ type: 'absolute_timeout', attempt });
           return;
         }
 
-        const effectiveIdleMs = Math.max(
-          1,
-          Math.min(NIM_STREAM_IDLE_TIMEOUT_MS, remaining)
-        );
+        const effectiveIdleMs = Math.max(1, Math.min(NIM_STREAM_IDLE_TIMEOUT_MS, remaining));
 
         idleTimer = setTimeout(() => {
           attempt.status = 'aborted';
           attempt.aborted = true;
-          attempt.abortReason =
-            effectiveIdleMs < NIM_STREAM_IDLE_TIMEOUT_MS
-              ? 'timeout_absolute'
-              : 'stream_idle';
+          attempt.abortReason = effectiveIdleMs < NIM_STREAM_IDLE_TIMEOUT_MS ? 'timeout_absolute' : 'stream_idle';
           attempt.settled = true;
-
           cleanup();
 
           try {
@@ -1523,14 +1423,7 @@ async function handleAdvancedNimMode({
 
           safeDestroyStream(stream);
           updateAttemptsDebug();
-
-          resolve({
-            type:
-              attempt.abortReason === 'timeout_absolute'
-                ? 'absolute_timeout'
-                : 'stream_idle_timeout',
-            attempt
-          });
+          resolve({ type: attempt.abortReason === 'timeout_absolute' ? 'absolute_timeout' : 'stream_idle_timeout', attempt });
         }, effectiveIdleMs);
       };
 
@@ -1557,11 +1450,7 @@ async function handleAdvancedNimMode({
         attempt.status = 'completed';
         attempt.settled = true;
         updateAttemptsDebug();
-
-        resolve({
-          type: 'completed',
-          attempt
-        });
+        resolve({ type: 'completed', attempt });
       };
 
       const onError = (error) => {
@@ -1573,7 +1462,6 @@ async function handleAdvancedNimMode({
           attempt.aborted = true;
           attempt.abortReason = 'client_closed';
           updateAttemptsDebug();
-
           resolve({ type: 'client_closed', attempt });
           return;
         }
@@ -1582,11 +1470,7 @@ async function handleAdvancedNimMode({
           attempt.status = 'aborted';
           attempt.aborted = true;
           updateAttemptsDebug();
-
-          resolve({
-            type: 'stream_idle_timeout',
-            attempt
-          });
+          resolve({ type: 'stream_idle_timeout', attempt });
           return;
         }
 
@@ -1594,11 +1478,7 @@ async function handleAdvancedNimMode({
           attempt.status = 'aborted';
           attempt.aborted = true;
           updateAttemptsDebug();
-
-          resolve({
-            type: 'absolute_timeout',
-            attempt
-          });
+          resolve({ type: 'absolute_timeout', attempt });
           return;
         }
 
@@ -1607,23 +1487,14 @@ async function handleAdvancedNimMode({
           attempt.aborted = true;
           attempt.abortReason = attempt.abortReason || 'aborted';
           updateAttemptsDebug();
-
-          resolve({
-            type: attempt.abortReason === 'client_closed' ? 'client_closed' : 'aborted',
-            attempt
-          });
+          resolve({ type: attempt.abortReason === 'client_closed' ? 'client_closed' : 'aborted', attempt });
           return;
         }
 
         attempt.status = 'stream_error';
         attempt.error = error;
         updateAttemptsDebug();
-
-        resolve({
-          type: 'stream_error',
-          attempt,
-          error
-        });
+        resolve({ type: 'stream_error', attempt, error });
       };
 
       stream.on('data', onData);
@@ -1641,30 +1512,19 @@ async function handleAdvancedNimMode({
     markClientClosed();
   });
 
-  const maxAttempts = NIM_TIMEOUT_RETRY_SWITCH
-    ? Math.max(1, NIM_TIMEOUT_MAX_RETRIES)
-    : 1;
+  const maxAttempts = NIM_TIMEOUT_RETRY_SWITCH ? Math.max(1, NIM_TIMEOUT_MAX_RETRIES) : 1;
 
   for (let attemptIndex = 1; attemptIndex <= maxAttempts; attemptIndex += 1) {
-    if (state.clientClosed || state.finalized) {
-      return;
-    }
+    if (state.clientClosed || state.finalized) return;
 
     if (remainingAbsoluteMs() <= 0) {
-      finalizeWithError(
-        504,
-        `Upstream absolute timeout after ${NIM_TIMEOUT_MS} ms`,
-        'timeout',
-        'absolute'
-      );
+      finalizeWithError(504, `Upstream absolute timeout after ${NIM_TIMEOUT_MS} ms`, 'timeout', 'absolute');
       return;
     }
 
     const firstStageResult = await runAttemptUntilFirstChunk(attemptIndex);
 
-    if (state.clientClosed || state.finalized) {
-      return;
-    }
+    if (state.clientClosed || state.finalized) return;
 
     if (firstStageResult.type === 'first_chunk') {
       const winnerResult = await consumeWinningStream(
@@ -1673,9 +1533,7 @@ async function handleAdvancedNimMode({
         firstStageResult.firstChunk
       );
 
-      if (state.clientClosed || state.finalized) {
-        return;
-      }
+      if (state.clientClosed || state.finalized) return;
 
       if (winnerResult.type === 'completed') {
         finalizeSuccess();
@@ -1683,22 +1541,12 @@ async function handleAdvancedNimMode({
       }
 
       if (winnerResult.type === 'stream_idle_timeout') {
-        finalizeWithError(
-          504,
-          `Stream idle timeout after ${NIM_STREAM_IDLE_TIMEOUT_MS} ms`,
-          'timeout',
-          'stream_idle'
-        );
+        finalizeWithError(504, `Stream idle timeout after ${NIM_STREAM_IDLE_TIMEOUT_MS} ms`, 'timeout', 'stream_idle');
         return;
       }
 
       if (winnerResult.type === 'absolute_timeout') {
-        finalizeWithError(
-          504,
-          `Upstream absolute timeout after ${NIM_TIMEOUT_MS} ms`,
-          'timeout',
-          'absolute'
-        );
+        finalizeWithError(504, `Upstream absolute timeout after ${NIM_TIMEOUT_MS} ms`, 'timeout', 'absolute');
         return;
       }
 
@@ -1710,28 +1558,16 @@ async function handleAdvancedNimMode({
           (typeof error?.response?.data === 'string' ? error.response.data : error?.message) ||
           'Upstream stream failed';
 
-        finalizeWithError(
-          status,
-          message,
-          'stream_error',
-          null
-        );
+        finalizeWithError(status, message, 'stream_error', null);
         return;
       }
 
-      finalizeWithError(
-        502,
-        'Winner stream ended unexpectedly',
-        'stream_error',
-        null
-      );
+      finalizeWithError(502, 'Winner stream ended unexpectedly', 'stream_error', null);
       return;
     }
 
     if (firstStageResult.type === 'timeout') {
-      updateRecentRequest(requestId, {
-        timed_out_stage: firstStageResult.stage
-      });
+      updateRecentRequest(requestId, { timed_out_stage: firstStageResult.stage });
 
       if (firstStageResult.retryable && attemptIndex < maxAttempts && NIM_TIMEOUT_RETRY_SWITCH) {
         updateRecentRequest(requestId, {
@@ -1740,35 +1576,19 @@ async function handleAdvancedNimMode({
         });
 
         if (NIM_TIMEOUT_RETRY_DELAY_MS > 0) {
-          const delayMs = Math.min(
-            NIM_TIMEOUT_RETRY_DELAY_MS,
-            Math.max(0, remainingAbsoluteMs())
-          );
-
-          if (delayMs > 0) {
-            await sleep(delayMs);
-          }
+          const delayMs = Math.min(NIM_TIMEOUT_RETRY_DELAY_MS, Math.max(0, remainingAbsoluteMs()));
+          if (delayMs > 0) await sleep(delayMs);
         }
 
         continue;
       }
 
-      finalizeWithError(
-        504,
-        firstStageResult.message,
-        'timeout',
-        firstStageResult.stage
-      );
+      finalizeWithError(504, firstStageResult.message, 'timeout', firstStageResult.stage);
       return;
     }
 
     if (firstStageResult.type === 'ended_before_first_chunk') {
-      finalizeWithError(
-        502,
-        firstStageResult.message || 'Upstream stream ended before first chunk',
-        'error',
-        null
-      );
+      finalizeWithError(502, firstStageResult.message || 'Upstream stream ended before first chunk', 'error', null);
       return;
     }
 
@@ -1784,12 +1604,7 @@ async function handleAdvancedNimMode({
         message = error.message;
       }
 
-      finalizeWithError(
-        error.response.status,
-        message,
-        'error',
-        null
-      );
+      finalizeWithError(error.response.status, message, 'error', null);
       return;
     }
 
@@ -1801,39 +1616,21 @@ async function handleAdvancedNimMode({
         (typeof error?.response?.data === 'string' ? error.response.data : error?.message) ||
         'Upstream request failed before first chunk';
 
-      finalizeWithError(
-        status,
-        message,
-        'error',
-        null
-      );
+      finalizeWithError(status, message, 'error', null);
       return;
     }
 
-    if (firstStageResult.type === 'client_closed') {
-      return;
-    }
+    if (firstStageResult.type === 'client_closed') return;
 
     if (firstStageResult.type === 'aborted') {
-      finalizeWithError(
-        502,
-        'Upstream request aborted',
-        'error',
-        null
-      );
+      finalizeWithError(502, 'Upstream request aborted', 'error', null);
       return;
     }
   }
 
-  finalizeWithError(
-    502,
-    'All upstream attempts failed',
-    'error',
-    null
-  );
+  finalizeWithError(502, 'All upstream attempts failed', 'error', null);
 }
 
-// Health check
 app.get('/health', (req, res) => {
   res.json({
     status: 'ok',
@@ -1841,6 +1638,7 @@ app.get('/health', (req, res) => {
     simple_nim: SIMPLE_NIM,
     nim_api_base: NIM_API_BASE,
     reasoning_display: SHOW_REASONING,
+    nim_manual_remove_thinking: NIM_MANUAL_REMOVE_THINKING,
     nim_force_max_tokens: NIM_FORCE_MAX_TOKENS_ENABLED ? NIM_FORCE_MAX_TOKENS : null,
     nim_reasoning: getNimReasoningDebug(),
     api_key_configured: Boolean(NIM_API_KEY),
@@ -1856,7 +1654,6 @@ app.get('/health', (req, res) => {
   });
 });
 
-// Safe recent requests debug endpoint
 app.get('/debug/recent-requests', (req, res) => {
   const data = recentRequests.map((r) => ({
     started_at: r.started_at,
@@ -1871,6 +1668,7 @@ app.get('/debug/recent-requests', (req, res) => {
     retry_delay_ms: r.retry_delay_ms ?? null,
     force_max_tokens: r.force_max_tokens ?? null,
     reasoning_mode: r.reasoning_mode ?? null,
+    manual_remove_thinking: Boolean(r.manual_remove_thinking),
     message_count: r.message_count,
     body_keys: r.body_keys || [],
     requested_max_tokens: r.requested_max_tokens,
@@ -1908,7 +1706,6 @@ app.get('/debug/recent-requests', (req, res) => {
   });
 });
 
-// OpenAI-compatible models list
 app.get('/v1/models', (req, res) => {
   const models = Object.keys(MODEL_MAPPING).map((model) => ({
     id: model,
@@ -1917,13 +1714,9 @@ app.get('/v1/models', (req, res) => {
     owned_by: 'nvidia-nim-proxy'
   }));
 
-  res.json({
-    object: 'list',
-    data: models
-  });
+  res.json({ object: 'list', data: models });
 });
 
-// Main proxy endpoint
 app.post('/v1/chat/completions', async (req, res) => {
   const body = req.body || {};
   const requestId = `req_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
@@ -1943,6 +1736,7 @@ app.post('/v1/chat/completions', async (req, res) => {
     retry_delay_ms: SIMPLE_NIM ? 0 : NIM_TIMEOUT_RETRY_DELAY_MS,
     force_max_tokens: NIM_FORCE_MAX_TOKENS_ENABLED ? NIM_FORCE_MAX_TOKENS : null,
     reasoning_mode: NIM_REASONING_MODE,
+    manual_remove_thinking: NIM_MANUAL_REMOVE_THINKING,
     message_count: Array.isArray(body.messages) ? body.messages.length : 0,
     body_keys: safeBodyKeys(body),
     requested_max_tokens:
@@ -1965,9 +1759,7 @@ app.post('/v1/chat/completions', async (req, res) => {
         error: 'NIM_API_KEY is not configured'
       });
 
-      return res.status(500).json(
-        createOpenAIError(500, 'NIM_API_KEY is not configured', 'configuration_error')
-      );
+      return res.status(500).json(createOpenAIError(500, 'NIM_API_KEY is not configured', 'configuration_error'));
     }
 
     const { model, messages } = body;
@@ -2001,12 +1793,7 @@ app.post('/v1/chat/completions', async (req, res) => {
       model_probe_used: modelProbeUsed
     });
 
-    const nimRequest = buildNimRequest(
-      body,
-      nimModel,
-      normalizedMessages,
-      SIMPLE_NIM ? Boolean(body.stream) : true
-    );
+    const nimRequest = buildNimRequest(body, nimModel, normalizedMessages, SIMPLE_NIM ? Boolean(body.stream) : true);
 
     updateRecentRequest(requestId, {
       request_options_forwarded: {
@@ -2065,22 +1852,19 @@ app.post('/v1/chat/completions', async (req, res) => {
     });
 
     if (!res.headersSent) {
-      return res
-        .status(status)
-        .json(
-          createOpenAIError(
-            status,
-            message,
-            errorStatus === 'timeout' ? 'timeout_error' : openAIErrorTypeByStatus(status)
-          )
-        );
+      return res.status(status).json(
+        createOpenAIError(
+          status,
+          message,
+          errorStatus === 'timeout' ? 'timeout_error' : openAIErrorTypeByStatus(status)
+        )
+      );
     }
 
     res.end();
   }
 });
 
-// Optional root info
 app.get('/', (req, res) => {
   res.json({
     service: 'OpenAI to NVIDIA NIM Proxy',
@@ -2094,11 +1878,8 @@ app.get('/', (req, res) => {
   });
 });
 
-// Catch-all
 app.all('*', (req, res) => {
-  res.status(404).json(
-    createOpenAIError(404, `Endpoint ${req.path} not found`)
-  );
+  res.status(404).json(createOpenAIError(404, `Endpoint ${req.path} not found`));
 });
 
 app.listen(PORT, () => {
@@ -2108,11 +1889,8 @@ app.listen(PORT, () => {
   console.log(`NIM API base: ${NIM_API_BASE}`);
   console.log(`Simple mode: ${SIMPLE_NIM ? 'ENABLED' : 'DISABLED'}`);
   console.log(`Reasoning display: ${SHOW_REASONING ? 'ENABLED' : 'DISABLED'}`);
-  console.log(
-    `Force max_tokens: ${
-      NIM_FORCE_MAX_TOKENS_ENABLED ? NIM_FORCE_MAX_TOKENS : 'DISABLED'
-    }`
-  );
+  console.log(`Manual <thinking> removal: ${NIM_MANUAL_REMOVE_THINKING ? 'ENABLED' : 'DISABLED'}`);
+  console.log(`Force max_tokens: ${NIM_FORCE_MAX_TOKENS_ENABLED ? NIM_FORCE_MAX_TOKENS : 'DISABLED'}`);
   console.log(`NIM reasoning mode: ${NIM_REASONING_MODE}`);
   console.log(`NIM extra_body: ${JSON.stringify(getNimReasoningExtraBody())}`);
   console.log(`API key configured: ${NIM_API_KEY ? 'YES' : 'NO'}`);
