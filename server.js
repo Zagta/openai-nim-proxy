@@ -150,9 +150,9 @@ function removeThinkingBlocksFromStreamChunk(value, state) {
   const text = contentToString(value);
   if (!NIM_MANUAL_REMOVE_THINKING || !text) return text;
 
-  const OPEN_RE = /<thinking\b[^>]*>/i;
-  const CLOSE_RE = /<\/thinking>/i;
-  const KEEP_TAIL = '</thinking>'.length - 1;
+  const OPEN_RE = /<think\b[^>]*>/i;
+  const CLOSE_RE = /<\/think>/i;
+  const KEEP_TAIL = '</think>'.length - 1;
 
   state.pending += text;
   let output = '';
