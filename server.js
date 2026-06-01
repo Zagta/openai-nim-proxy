@@ -55,6 +55,8 @@ const SLOW_REQUEST_MS = Number(process.env.SLOW_REQUEST_MS || 15000);
 const RECENT_REQUESTS_LIMIT = 5;
 const recentRequests = [];
 
+const NIM_PLAYGROUND_MODEL_NAME = String(process.env.NIM_PLAYGROUND_MODEL_NAME)
+
 // Model mapping
 const MODEL_MAPPING = {
   'gpt-3.5-turbo': 'mistralai/mistral-medium-3.5-128b',
@@ -67,7 +69,7 @@ const MODEL_MAPPING = {
   'claude-3-opus': 'nvidia/nemotron-3-super-120b-a12b',
   'claude-3-sonnet': 'openai/gpt-oss-20b',
   
-  'gemini-pro': 'qwen/qwen3-next-80b-a3b-thinking'
+  'gemini-pro': NIM_PLAYGROUND_MODEL_NAME
 };
 
 const DEBUG_RECEIVED_OPTION_KEYS = [
