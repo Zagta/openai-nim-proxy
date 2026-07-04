@@ -503,8 +503,9 @@ function buildNimRequest(body, nimModel, normalizedMessages, streamValue) {
   if (nimRequest.temperature === undefined) nimRequest.temperature = 0.7;
 
   const forcedExtraBody = getNimReasoningExtraBody();
-  if (forcedExtraBody) nimRequest.extra_body = forcedExtraBody;
-
+  if (forcedExtraBody) {
+    Object.assign(nimRequest, forcedExtraBody);
+  }
   return nimRequest;
 }
 
