@@ -50,7 +50,7 @@ const NIM_PLAYGROUND_MODEL_NAME = String(process.env.NIM_PLAYGROUND_MODEL_NAME |
 
 const MODEL_MAPPING = {
   'gpt-3.5-turbo': 'mistralai/mistral-medium-3.5-128b',
-  'gpt-4': 'deepseek-ai/deepseek-v4-flash',
+  'gpt-4': 'deepseek-ai/deepseek-v4-flash-0731',
   'gpt-4-turbo': 'deepseek-ai/deepseek-v4-pro',
   'claude-3-opus': 'nvidia/nemotron-3-super-120b-a12b',
   'claude-3-sonnet': 'openai/gpt-oss-20b',
